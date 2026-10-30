@@ -1,0 +1,12 @@
+{
+  "name": "linkdrop",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --dir apps/desktop dev",
+    "build": "pnpm --dir apps/desktop build",
+    "typecheck": "pnpm --dir apps/desktop typecheck",
+    "lint": "pnpm --dir apps/desktop lint",
+    "format": "prettier --write ."
+  },
+  "devDependencies": { "prettier": "^3.4.2" }
+}

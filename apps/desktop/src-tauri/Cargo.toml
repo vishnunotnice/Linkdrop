@@ -1,0 +1,20 @@
+[package]
+name = "linkdrop-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+linkdrop-core = { path = "../../../crates/linkdrop-core" }
+linkdrop-discovery = { path = "../../../crates/linkdrop-discovery" }
+linkdrop-identity = { path = "../../../crates/linkdrop-identity" }
+serde.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-store = "2"
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }

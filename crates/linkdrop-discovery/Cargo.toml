@@ -1,0 +1,12 @@
+[package]
+name = "linkdrop-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+linkdrop-core = { path = "../linkdrop-core" }
+mdns-sd = "0.14"
+serde.workspace = true
+thiserror.workspace = true
