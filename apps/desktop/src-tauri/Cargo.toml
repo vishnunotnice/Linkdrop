@@ -13,7 +13,10 @@ linkdrop-discovery = { path = "../../../crates/linkdrop-discovery" }
 linkdrop-identity = { path = "../../../crates/linkdrop-identity" }
 linkdrop-protocol = { path = "../../../crates/linkdrop-protocol" }
 linkdrop-storage = { path = "../../../crates/linkdrop-storage" }
+linkdrop-transfer = { path = "../../../crates/linkdrop-transfer" }
 serde.workspace = true
+quinn.workspace = true
+tokio.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-store = "2"

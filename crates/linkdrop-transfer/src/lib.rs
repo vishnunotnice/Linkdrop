@@ -88,6 +88,37 @@ pub async fn respond_to_transfer(
     Ok(offer)
 }
 
+/// Reads a transfer offer but deliberately leaves the decision stream open.
+///
+/// Desktop receivers use this variant to show an explicit approval prompt before
+/// sending a decision. No file stream is accepted until the user accepts.
+pub async fn receive_transfer_offer(
+    connection: &quinn::Connection,
+) -> Result<(TransferOffer, quinn::SendStream), TransferProtocolError> {
+    let (send, mut receive) = connection
+        .accept_bi()
+        .await
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    let offer: TransferOffer = read_message(&mut receive).await?;
+    validate_offer(&offer)?;
+    Ok((offer, send))
+}
+
+/// Sends the explicit user decision for an offer returned by [`receive_transfer_offer`].
+pub async fn send_transfer_decision(
+    send: &mut quinn::SendStream,
+    offer: &TransferOffer,
+    accepted: bool,
+) -> Result<(), TransferProtocolError> {
+    let decision = TransferDecision {
+        transfer_id: offer.transfer_id.clone(),
+        accepted,
+    };
+    write_message(send, &decision).await?;
+    send.finish()
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))
+}
+
 /// Streams the approved source file over an authenticated QUIC unidirectional stream.
 ///
 /// The caller must invoke this only after `request_transfer` receives an accepted decision.

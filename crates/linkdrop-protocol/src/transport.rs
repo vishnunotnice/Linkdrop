@@ -10,6 +10,7 @@ use crate::tls::{
 };
 
 /// A QUIC endpoint that accepts only the configured trusted peers.
+#[derive(Clone)]
 pub struct SecureEndpoint {
     endpoint: quinn::Endpoint,
 }
