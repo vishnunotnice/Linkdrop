@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 blake3.workspace = true
 ed25519-dalek.workspace = true
+rcgen.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+x509-parser.workspace = true
 rand_core.workspace = true
 thiserror.workspace = true
 

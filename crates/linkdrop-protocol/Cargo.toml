@@ -5,5 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
+ed25519-dalek.workspace = true
 linkdrop-core = { path = "../linkdrop-core" }
+linkdrop-identity = { path = "../linkdrop-identity" }
+rand_core.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
