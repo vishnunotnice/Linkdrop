@@ -80,7 +80,7 @@ struct TrustedPeerInfo {
     certificate_fingerprint: String,
     status: String,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PairingRequest {
     local: PairingEnvelope,
@@ -676,6 +676,7 @@ fn main() {
             let pairing_listener = pairing_endpoint.clone();
             let pairing_identity = Arc::clone(&identity);
             let pairing_certificate = certificate.clone();
+            let pairing_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 while let Ok(Some(connection)) = pairing_listener.accept().await {
                     let now = std::time::SystemTime::now()
@@ -684,8 +685,30 @@ fn main() {
                         .unwrap_or_default();
                     let local =
                         PairingEnvelope::create(&pairing_identity, &pairing_certificate, now);
-                    if let Err(error) = respond_to_pairing_exchange(&connection, &local).await {
-                        tracing::warn!(%error, "pairing exchange failed");
+                    match respond_to_pairing_exchange(&connection, &local).await {
+                        Ok(remote) => match verify_pairing_envelope(
+                            &local,
+                            &remote,
+                            b"linkdrop-pair/1",
+                            now,
+                        ) {
+                            Ok((_, verification_code)) => {
+                                if let Err(error) = pairing_handle.emit(
+                                    "pairing-request",
+                                    PairingRequest {
+                                        local,
+                                        remote,
+                                        verification_code,
+                                    },
+                                ) {
+                                    tracing::warn!(%error, "failed to show pairing request");
+                                }
+                            }
+                            Err(error) => tracing::warn!(%error, "pairing validation failed"),
+                        },
+                        Err(error) => {
+                            tracing::warn!(%error, "pairing exchange failed");
+                        }
                     }
                     connection.close(0u32.into(), b"pairing exchange complete");
                 }
