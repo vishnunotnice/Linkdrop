@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Home, MonitorUp, Settings as SettingsIcon } from "lucide-react";
 import { readSettings, writeSettings } from "./lib/settings";
+import "./styles/transfers.css";
 import type { DesktopTransfer, Device, Settings } from "./types/models";
 
 type Page = "Home" | "Transfers" | "History" | "Settings";

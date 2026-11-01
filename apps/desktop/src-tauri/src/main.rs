@@ -659,17 +659,20 @@ fn main() {
             )?;
             let peer_store = JsonTrustedPeerStore::new(app_config.join("trusted-peers.json"));
             let peers = peer_store.read_peers()?;
-            let endpoint = SecureEndpoint::bind(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-                &identity,
-                &certificate,
-                &peers.trusted_peers(),
-            )?;
-            let pairing_endpoint = PairingEndpoint::bind(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-                &identity,
-                &certificate,
-            )?;
+            let (endpoint, pairing_endpoint) = tauri::async_runtime::block_on(async {
+                let endpoint = SecureEndpoint::bind(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                    &identity,
+                    &certificate,
+                    &peers.trusted_peers(),
+                )?;
+                let pairing_endpoint = PairingEndpoint::bind(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                    &identity,
+                    &certificate,
+                )?;
+                Ok::<_, Box<dyn std::error::Error>>((endpoint, pairing_endpoint))
+            })?;
             let pairing_listener = pairing_endpoint.clone();
             let pairing_identity = Arc::clone(&identity);
             let pairing_certificate = certificate.clone();

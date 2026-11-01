@@ -1,0 +1,77 @@
+.composer {
+  align-items: flex-start;
+  gap: 20px;
+}
+
+.composer b,
+.transfer b {
+  color: #f4f4f5;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.composer p,
+.composer small {
+  color: #b4b4bf;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.composer select {
+  display: block;
+  width: min(430px, 100%);
+  margin-top: 12px;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid #52525b;
+  border-radius: 8px;
+  background: #0c0c0f;
+  color: #f4f4f5;
+  font: 500 13px/1.3 "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  padding: 10px 36px 10px 12px;
+}
+
+.composer select:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px #3b82f633;
+  outline: none;
+}
+
+.composer select option {
+  background: #18181b;
+  color: #f4f4f5;
+}
+
+.transfer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.primary {
+  border: 1px solid #60a5fa;
+  border-radius: 7px;
+  background: #3b82f6;
+  color: #fff;
+  padding: 8px 12px;
+  font: 600 12px/1 "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  cursor: pointer;
+}
+
+.primary:disabled {
+  cursor: not-allowed;
+  opacity: .45;
+}
+
+.error-text {
+  color: #fca5a5 !important;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.transfer-list {
+  display: grid;
+  gap: 10px;
+}

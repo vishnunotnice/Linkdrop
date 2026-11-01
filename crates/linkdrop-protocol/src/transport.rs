@@ -1,6 +1,9 @@
 //! Endpoint lifecycle for Linkdrop's pinned mutual-TLS QUIC transport.
 
-use std::net::SocketAddr;
+use std::{
+    net::{SocketAddr, UdpSocket},
+    sync::Arc,
+};
 
 use linkdrop_identity::{DeviceCertificate, DeviceIdentity, TrustedPeer};
 
@@ -28,7 +31,7 @@ impl PairingEndpoint {
         certificate: &DeviceCertificate,
     ) -> Result<Self, TransportError> {
         Ok(Self {
-            endpoint: quinn::Endpoint::server(
+            endpoint: bind_endpoint(
                 build_pairing_server_config(identity, certificate)?,
                 bind_address,
             )?,
@@ -91,7 +94,7 @@ impl SecureEndpoint {
     ) -> Result<Self, TransportError> {
         let config = build_server_config(identity, certificate, trusted_peers)?;
         Ok(Self {
-            endpoint: quinn::Endpoint::server(config, bind_address)?,
+            endpoint: bind_endpoint(config, bind_address)?,
         })
     }
 
@@ -139,6 +142,19 @@ impl SecureEndpoint {
         self.endpoint
             .close(0u32.into(), b"linkdrop endpoint shutdown");
     }
+}
+
+fn bind_endpoint(
+    config: quinn::ServerConfig,
+    address: SocketAddr,
+) -> std::io::Result<quinn::Endpoint> {
+    let socket = UdpSocket::bind(address)?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(config),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
 }
 
 #[cfg(test)]
