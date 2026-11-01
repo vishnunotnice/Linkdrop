@@ -285,6 +285,7 @@ async fn begin_pairing(
     let address = format!("{address}:{pairing_port}")
         .parse()
         .map_err(|_| "the discovered pairing address is invalid".to_owned())?;
+    tracing::info!(remote = %address, "starting pairing exchange");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "system clock is unavailable".to_owned())?
@@ -298,6 +299,7 @@ async fn begin_pairing(
     let remote = initiate_pairing_exchange(&connection, &local)
         .await
         .map_err(|error| error.to_string())?;
+    tracing::info!(remote = %address, "received pairing envelope");
     let (_, verification_code) = verify_pairing_envelope(&local, &remote, b"linkdrop-pair/1", now)
         .map_err(|error| error.to_string())?;
     connection.close(0u32.into(), b"pairing exchange complete");
@@ -679,12 +681,14 @@ fn main() {
             let pairing_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 while let Ok(Some(connection)) = pairing_listener.accept().await {
+                    tracing::info!(remote = %connection.remote_address(), "received pairing connection");
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|duration| duration.as_secs() as i64)
                         .unwrap_or_default();
                     let local =
                         PairingEnvelope::create(&pairing_identity, &pairing_certificate, now);
+                    tracing::info!(remote = %connection.remote_address(), "waiting for pairing envelope");
                     match respond_to_pairing_exchange(&connection, &local).await {
                         Ok(remote) => match verify_pairing_envelope(
                             &local,
@@ -693,6 +697,10 @@ fn main() {
                             now,
                         ) {
                             Ok((_, verification_code)) => {
+                                tracing::info!(
+                                    remote = %connection.remote_address(),
+                                    "pairing envelope verified; showing confirmation"
+                                );
                                 if let Err(error) = pairing_handle.emit(
                                     "pairing-request",
                                     PairingRequest {
@@ -702,6 +710,8 @@ fn main() {
                                     },
                                 ) {
                                     tracing::warn!(%error, "failed to show pairing request");
+                                } else {
+                                    tracing::info!("pairing confirmation event sent to desktop UI");
                                 }
                             }
                             Err(error) => tracing::warn!(%error, "pairing validation failed"),

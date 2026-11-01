@@ -1,0 +1,44 @@
+.pairing-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.68);
+  backdrop-filter: blur(8px);
+}
+
+.pairing-modal {
+  width: min(420px, 100%);
+  padding: 30px;
+  border: 1px solid #3f3f46;
+  border-radius: 16px;
+  background: #18181b;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+}
+
+.pairing-modal h2 {
+  margin: 9px 0 7px;
+  font-size: 22px;
+  letter-spacing: -0.6px;
+}
+
+.pairing-code {
+  display: block;
+  margin: 24px 0;
+  padding: 16px;
+  border: 1px solid #3b82f6;
+  border-radius: 10px;
+  color: #fff;
+  background: #0c162a;
+  font: 700 30px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.14em;
+  text-align: center;
+}
+
+.pairing-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+}
