@@ -1,5 +1,242 @@
 //! Transfer state-machine boundary; no file I/O in Phase 1.
+use std::path::{Path, PathBuf};
+
 use linkdrop_core::TransferStatus;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const MAX_CONTROL_MESSAGE_BYTES: usize = 16 * 1024;
+const FILE_CHUNK_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferOffer {
+    pub transfer_id: String,
+    pub filename: String,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferDecision {
+    pub transfer_id: String,
+    pub accepted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferProgress {
+    pub transfer_id: String,
+    pub transferred_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TransferProtocolError {
+    #[error("transfer offer is invalid")]
+    InvalidOffer,
+    #[error("transfer response does not match the offer")]
+    MismatchedResponse,
+    #[error("transfer control stream failed: {0}")]
+    Stream(#[from] quinn::ConnectionError),
+    #[error("transfer control message failed: {0}")]
+    Message(String),
+    #[error("file transfer failed: {0}")]
+    File(String),
+    #[error("received file size does not match the approved offer")]
+    SizeMismatch,
+}
+
+/// Sends an authenticated transfer offer and waits for the peer's decision.
+///
+/// The caller must obtain `connection` from Linkdrop's pinned mTLS transport. This function
+/// deliberately transfers no file bytes; it is the approval boundary preceding file I/O.
+pub async fn request_transfer(
+    connection: &quinn::Connection,
+    offer: TransferOffer,
+) -> Result<TransferDecision, TransferProtocolError> {
+    validate_offer(&offer)?;
+    let (mut send, mut receive) = connection
+        .open_bi()
+        .await
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    write_message(&mut send, &offer).await?;
+    send.finish()
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    let decision: TransferDecision = read_message(&mut receive).await?;
+    if decision.transfer_id != offer.transfer_id {
+        return Err(TransferProtocolError::MismatchedResponse);
+    }
+    Ok(decision)
+}
+
+/// Receives one transfer offer and sends the caller's approval decision.
+pub async fn respond_to_transfer(
+    connection: &quinn::Connection,
+    approve: impl FnOnce(&TransferOffer) -> bool,
+) -> Result<TransferOffer, TransferProtocolError> {
+    let (mut send, mut receive) = connection
+        .accept_bi()
+        .await
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    let offer: TransferOffer = read_message(&mut receive).await?;
+    validate_offer(&offer)?;
+    let decision = TransferDecision {
+        transfer_id: offer.transfer_id.clone(),
+        accepted: approve(&offer),
+    };
+    write_message(&mut send, &decision).await?;
+    send.finish()
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    Ok(offer)
+}
+
+/// Streams the approved source file over an authenticated QUIC unidirectional stream.
+///
+/// The caller must invoke this only after `request_transfer` receives an accepted decision.
+pub async fn send_file(
+    connection: &quinn::Connection,
+    source: &Path,
+    offer: &TransferOffer,
+    mut report_progress: impl FnMut(TransferProgress),
+) -> Result<(), TransferProtocolError> {
+    validate_offer(offer)?;
+    let metadata = tokio::fs::metadata(source)
+        .await
+        .map_err(|error| TransferProtocolError::File(error.to_string()))?;
+    if !metadata.is_file() || metadata.len() != offer.total_bytes {
+        return Err(TransferProtocolError::SizeMismatch);
+    }
+    let mut source = tokio::fs::File::open(source)
+        .await
+        .map_err(|error| TransferProtocolError::File(error.to_string()))?;
+    let mut stream = connection
+        .open_uni()
+        .await
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    let mut transferred_bytes = 0_u64;
+    let mut buffer = vec![0_u8; FILE_CHUNK_BYTES];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .await
+            .map_err(|error| TransferProtocolError::File(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        stream
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+        transferred_bytes += read as u64;
+        report_progress(TransferProgress {
+            transfer_id: offer.transfer_id.clone(),
+            transferred_bytes,
+            total_bytes: offer.total_bytes,
+        });
+    }
+    if transferred_bytes != offer.total_bytes {
+        return Err(TransferProtocolError::SizeMismatch);
+    }
+    stream
+        .finish()
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))
+}
+
+/// Receives an approved file into `directory`, reporting progress after every data chunk.
+///
+/// `filename` is validated before path construction and the destination is created with
+/// `create_new`, so an existing local file is never overwritten.
+pub async fn receive_file(
+    connection: &quinn::Connection,
+    directory: &Path,
+    offer: &TransferOffer,
+    mut report_progress: impl FnMut(TransferProgress),
+) -> Result<PathBuf, TransferProtocolError> {
+    validate_offer(offer)?;
+    tokio::fs::create_dir_all(directory)
+        .await
+        .map_err(|error| TransferProtocolError::File(error.to_string()))?;
+    let destination = directory.join(&offer.filename);
+    let mut destination_file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .await
+        .map_err(|error| TransferProtocolError::File(error.to_string()))?;
+    let mut stream = connection
+        .accept_uni()
+        .await
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    let mut transferred_bytes = 0_u64;
+    loop {
+        let Some(chunk) = stream
+            .read_chunk(FILE_CHUNK_BYTES, true)
+            .await
+            .map_err(|error| TransferProtocolError::Message(error.to_string()))?
+        else {
+            break;
+        };
+        if transferred_bytes + chunk.bytes.len() as u64 > offer.total_bytes {
+            let _ = tokio::fs::remove_file(&destination).await;
+            return Err(TransferProtocolError::SizeMismatch);
+        }
+        destination_file
+            .write_all(&chunk.bytes)
+            .await
+            .map_err(|error| TransferProtocolError::File(error.to_string()))?;
+        transferred_bytes += chunk.bytes.len() as u64;
+        report_progress(TransferProgress {
+            transfer_id: offer.transfer_id.clone(),
+            transferred_bytes,
+            total_bytes: offer.total_bytes,
+        });
+    }
+    destination_file
+        .flush()
+        .await
+        .map_err(|error| TransferProtocolError::File(error.to_string()))?;
+    if transferred_bytes != offer.total_bytes {
+        let _ = tokio::fs::remove_file(&destination).await;
+        return Err(TransferProtocolError::SizeMismatch);
+    }
+    Ok(destination)
+}
+
+async fn write_message<T: Serialize>(
+    stream: &mut quinn::SendStream,
+    message: &T,
+) -> Result<(), TransferProtocolError> {
+    let encoded = serde_json::to_vec(message)
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    if encoded.len() > MAX_CONTROL_MESSAGE_BYTES {
+        return Err(TransferProtocolError::InvalidOffer);
+    }
+    stream
+        .write_all(&encoded)
+        .await
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))
+}
+
+async fn read_message<T: for<'de> Deserialize<'de>>(
+    stream: &mut quinn::RecvStream,
+) -> Result<T, TransferProtocolError> {
+    let encoded = stream
+        .read_to_end(MAX_CONTROL_MESSAGE_BYTES)
+        .await
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    serde_json::from_slice(&encoded)
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))
+}
+
+fn validate_offer(offer: &TransferOffer) -> Result<(), TransferProtocolError> {
+    if offer.transfer_id.is_empty()
+        || offer.transfer_id.len() > 128
+        || offer.filename.is_empty()
+        || offer.filename.len() > 255
+        || offer.filename.contains(['/', '\\', '\0'])
+    {
+        return Err(TransferProtocolError::InvalidOffer);
+    }
+    Ok(())
+}
 #[derive(Debug, thiserror::Error)]
 pub enum TransitionError {
     #[error("invalid transfer transition from {from:?} to {to:?}")]
@@ -22,11 +259,205 @@ pub fn can_transition(from: TransferStatus, to: TransferStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use linkdrop_identity::{DeviceCertificate, DeviceIdentity, TrustedPeer};
+    use linkdrop_protocol::transport::SecureEndpoint;
+    use std::sync::{Arc, Mutex};
     #[test]
     fn permits_cancel() {
         assert!(can_transition(
             TransferStatus::Paused,
             TransferStatus::Cancelled
         ));
+    }
+    #[test]
+    fn rejects_unsafe_filenames_before_opening_a_stream() {
+        assert!(matches!(
+            validate_offer(&TransferOffer {
+                transfer_id: "transfer-1".into(),
+                filename: "../../unsafe".into(),
+                total_bytes: 1,
+            }),
+            Err(TransferProtocolError::InvalidOffer)
+        ));
+    }
+
+    #[tokio::test]
+    async fn trusted_connection_carries_an_approved_transfer_offer() {
+        let server_identity = DeviceIdentity::generate();
+        let server_certificate = DeviceCertificate::generate(&server_identity)
+            .unwrap_or_else(|error| panic!("certificate generation failed: {error}"));
+        let client_identity = DeviceIdentity::generate();
+        let client_certificate = DeviceCertificate::generate(&client_identity)
+            .unwrap_or_else(|error| panic!("certificate generation failed: {error}"));
+        let server_peer = TrustedPeer::provision(&server_identity, &server_certificate);
+        let client_peer = TrustedPeer::provision(&client_identity, &client_certificate);
+        let localhost = "127.0.0.1:0".parse().unwrap_or_else(|_| unreachable!());
+        let server = SecureEndpoint::bind(
+            localhost,
+            &server_identity,
+            &server_certificate,
+            std::slice::from_ref(&client_peer),
+        )
+        .unwrap_or_else(|error| panic!("server bind failed: {error}"));
+        let client = SecureEndpoint::bind(
+            localhost,
+            &client_identity,
+            &client_certificate,
+            std::slice::from_ref(&server_peer),
+        )
+        .unwrap_or_else(|error| panic!("client bind failed: {error}"));
+        let connect = client.connect(
+            server
+                .local_addr()
+                .unwrap_or_else(|error| panic!("server address unavailable: {error}")),
+            "linkdrop",
+            &client_identity,
+            &client_certificate,
+            server_peer,
+        );
+        let (client_connection, server_connection) = tokio::join!(connect, server.accept());
+        let client_connection =
+            client_connection.unwrap_or_else(|error| panic!("connect failed: {error}"));
+        let server_connection = server_connection
+            .unwrap_or_else(|error| panic!("accept failed: {error}"))
+            .expect("endpoint closed before accepting connection");
+        let offer = TransferOffer {
+            transfer_id: "transfer-1".into(),
+            filename: "photo.jpg".into(),
+            total_bytes: 42,
+        };
+
+        let (decision, received) = tokio::join!(
+            request_transfer(&client_connection, offer.clone()),
+            respond_to_transfer(&server_connection, |_| true),
+        );
+        assert_eq!(
+            received.unwrap_or_else(|error| panic!("receive failed: {error}")),
+            offer
+        );
+        assert_eq!(
+            decision.unwrap_or_else(|error| panic!("decision failed: {error}")),
+            TransferDecision {
+                transfer_id: "transfer-1".into(),
+                accepted: true,
+            }
+        );
+        client.close();
+        server.close();
+    }
+
+    #[tokio::test]
+    async fn approved_transfer_streams_file_bytes_and_reports_progress() {
+        let server_identity = DeviceIdentity::generate();
+        let server_certificate = DeviceCertificate::generate(&server_identity)
+            .unwrap_or_else(|error| panic!("certificate generation failed: {error}"));
+        let client_identity = DeviceIdentity::generate();
+        let client_certificate = DeviceCertificate::generate(&client_identity)
+            .unwrap_or_else(|error| panic!("certificate generation failed: {error}"));
+        let server_peer = TrustedPeer::provision(&server_identity, &server_certificate);
+        let client_peer = TrustedPeer::provision(&client_identity, &client_certificate);
+        let localhost = "127.0.0.1:0".parse().unwrap_or_else(|_| unreachable!());
+        let server = SecureEndpoint::bind(
+            localhost,
+            &server_identity,
+            &server_certificate,
+            std::slice::from_ref(&client_peer),
+        )
+        .unwrap_or_else(|error| panic!("server bind failed: {error}"));
+        let client = SecureEndpoint::bind(
+            localhost,
+            &client_identity,
+            &client_certificate,
+            std::slice::from_ref(&server_peer),
+        )
+        .unwrap_or_else(|error| panic!("client bind failed: {error}"));
+        let connect = client.connect(
+            server
+                .local_addr()
+                .unwrap_or_else(|error| panic!("server address unavailable: {error}")),
+            "linkdrop",
+            &client_identity,
+            &client_certificate,
+            server_peer,
+        );
+        let (client_connection, server_connection) = tokio::join!(connect, server.accept());
+        let client_connection =
+            client_connection.unwrap_or_else(|error| panic!("connect failed: {error}"));
+        let server_connection = server_connection
+            .unwrap_or_else(|error| panic!("accept failed: {error}"))
+            .expect("endpoint closed before accepting connection");
+        let payload = vec![0xA5; FILE_CHUNK_BYTES + 17];
+        let root = std::env::temp_dir().join(format!(
+            "linkdrop-transfer-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_else(|_| std::time::Duration::ZERO)
+                .as_nanos()
+        ));
+        let source = root.join("source.bin");
+        let downloads = root.join("downloads");
+        tokio::fs::create_dir_all(&root)
+            .await
+            .unwrap_or_else(|error| panic!("temporary directory failed: {error}"));
+        tokio::fs::write(&source, &payload)
+            .await
+            .unwrap_or_else(|error| panic!("temporary source write failed: {error}"));
+        let offer = TransferOffer {
+            transfer_id: "transfer-file-1".into(),
+            filename: "received.bin".into(),
+            total_bytes: payload.len() as u64,
+        };
+        let (decision, _) = tokio::join!(
+            request_transfer(&client_connection, offer.clone()),
+            respond_to_transfer(&server_connection, |_| true),
+        );
+        assert!(
+            decision
+                .unwrap_or_else(|error| panic!("decision failed: {error}"))
+                .accepted
+        );
+        let sent_progress = Arc::new(Mutex::new(Vec::new()));
+        let received_progress = Arc::new(Mutex::new(Vec::new()));
+        let sent_events = Arc::clone(&sent_progress);
+        let received_events = Arc::clone(&received_progress);
+        let (sent, received) = tokio::join!(
+            send_file(&client_connection, &source, &offer, move |progress| {
+                if let Ok(mut events) = sent_events.lock() {
+                    events.push(progress);
+                }
+            }),
+            receive_file(&server_connection, &downloads, &offer, move |progress| {
+                if let Ok(mut events) = received_events.lock() {
+                    events.push(progress);
+                }
+            }),
+        );
+        sent.unwrap_or_else(|error| panic!("send failed: {error}"));
+        let received = received.unwrap_or_else(|error| panic!("receive failed: {error}"));
+        assert_eq!(
+            tokio::fs::read(received)
+                .await
+                .unwrap_or_else(|error| panic!("received file read failed: {error}")),
+            payload
+        );
+        assert_eq!(
+            sent_progress
+                .lock()
+                .ok()
+                .and_then(|events| events.last().cloned())
+                .map(|progress| progress.transferred_bytes),
+            Some(offer.total_bytes)
+        );
+        assert_eq!(
+            received_progress
+                .lock()
+                .ok()
+                .and_then(|events| events.last().cloned())
+                .map(|progress| progress.transferred_bytes),
+            Some(offer.total_bytes)
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+        client.close();
+        server.close();
     }
 }

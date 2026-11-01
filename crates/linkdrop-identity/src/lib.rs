@@ -3,8 +3,8 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::OsRng;
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, PKCS_ED25519};
-use rustls_pki_types::PrivatePkcs8KeyDer;
-use std::{fs, io, path::Path};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use std::{collections::BTreeMap, fs, io, path::Path};
 use x509_parser::{extensions::ParsedExtension, prelude::parse_x509_certificate};
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +70,27 @@ pub struct DeviceCertificate {
     der: Vec<u8>,
     fingerprint: String,
 }
+pub struct TlsKeyMaterial {
+    pub certificate_chain: Vec<CertificateDer<'static>>,
+    pub private_key: PrivateKeyDer<'static>,
+}
+impl TlsKeyMaterial {
+    pub fn from_identity(
+        identity: &DeviceIdentity,
+        certificate: &DeviceCertificate,
+    ) -> Result<Self, CertificateError> {
+        certificate.matches(identity)?;
+        let pkcs8 = identity.pkcs8_der();
+        if pkcs8.len() != 48 {
+            return Err(CertificateError::Malformed);
+        }
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8));
+        Ok(Self {
+            certificate_chain: vec![CertificateDer::from(certificate.der().to_vec())],
+            private_key: key,
+        })
+    }
+}
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum TrustedPeerStatus {
     Trusted,
@@ -82,6 +103,54 @@ pub struct TrustedPeer {
     pub certificate_fingerprint: String,
     pub status: TrustedPeerStatus,
 }
+
+/// The persisted allow-list used for mutual TLS authentication.
+///
+/// Discovery records never add entries here: a peer becomes trusted only after a successful
+/// pairing flow explicitly provisions its certificate and public key.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct TrustedPeerRegistry {
+    peers: BTreeMap<String, TrustedPeer>,
+}
+
+impl TrustedPeerRegistry {
+    pub fn insert(&mut self, peer: TrustedPeer) {
+        self.peers.insert(peer.device_id.clone(), peer);
+    }
+
+    pub fn get(&self, device_id: &str) -> Option<&TrustedPeer> {
+        self.peers.get(device_id)
+    }
+
+    pub fn trusted_peers(&self) -> Vec<TrustedPeer> {
+        self.peers
+            .values()
+            .filter(|peer| peer.status == TrustedPeerStatus::Trusted)
+            .cloned()
+            .collect()
+    }
+
+    pub fn peers(&self) -> Vec<TrustedPeer> {
+        self.peers.values().cloned().collect()
+    }
+
+    pub fn block(&mut self, device_id: &str) -> bool {
+        let Some(peer) = self.peers.get_mut(device_id) else {
+            return false;
+        };
+        peer.status = TrustedPeerStatus::Blocked;
+        true
+    }
+
+    pub fn trust(&mut self, device_id: &str) -> bool {
+        let Some(peer) = self.peers.get_mut(device_id) else {
+            return false;
+        };
+        peer.status = TrustedPeerStatus::Trusted;
+        true
+    }
+}
+
 impl TrustedPeer {
     pub fn provision(identity: &DeviceIdentity, certificate: &DeviceCertificate) -> Self {
         Self {
@@ -90,6 +159,27 @@ impl TrustedPeer {
             certificate_fingerprint: certificate.fingerprint().to_owned(),
             status: TrustedPeerStatus::Trusted,
         }
+    }
+    /// Creates a trusted peer from a certificate received during an authenticated pairing flow.
+    pub fn from_certificate(certificate: &DeviceCertificate) -> Result<Self, CertificateError> {
+        let (_, parsed) =
+            parse_x509_certificate(certificate.der()).map_err(|_| CertificateError::Malformed)?;
+        let public_key: [u8; 32] = parsed
+            .tbs_certificate
+            .subject_pki
+            .subject_public_key
+            .data
+            .as_ref()
+            .try_into()
+            .map_err(|_| CertificateError::Malformed)?;
+        let peer = Self {
+            device_id: blake3::hash(&public_key).to_hex()[..24].to_string(),
+            public_key,
+            certificate_fingerprint: certificate.fingerprint().to_owned(),
+            status: TrustedPeerStatus::Trusted,
+        };
+        peer.verify_certificate(certificate)?;
+        Ok(peer)
     }
     pub fn verify_certificate(
         &self,
@@ -289,5 +379,41 @@ mod tests {
             .unwrap_or_else(|error| panic!("certificate reload failed: {error}"));
         assert_eq!(first.fingerprint(), second.fingerprint());
         let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn converts_identity_to_rustls_key_material() {
+        let identity = DeviceIdentity::generate();
+        let certificate = DeviceCertificate::generate(&identity)
+            .unwrap_or_else(|error| panic!("certificate generation failed: {error}"));
+        let material = TlsKeyMaterial::from_identity(&identity, &certificate)
+            .unwrap_or_else(|error| panic!("conversion failed: {error}"));
+        assert_eq!(material.certificate_chain.len(), 1);
+        assert!(TlsKeyMaterial::from_identity(&DeviceIdentity::generate(), &certificate).is_err());
+    }
+    #[test]
+    fn registry_excludes_blocked_peers_from_server_allow_list() {
+        let identity = DeviceIdentity::generate();
+        let certificate = DeviceCertificate::generate(&identity)
+            .unwrap_or_else(|error| panic!("certificate generation failed: {error}"));
+        let peer = TrustedPeer::provision(&identity, &certificate);
+        let mut registry = TrustedPeerRegistry::default();
+        registry.insert(peer.clone());
+        assert_eq!(registry.trusted_peers().len(), 1);
+        assert!(registry.block(&peer.device_id));
+        assert!(registry.trusted_peers().is_empty());
+        assert_eq!(
+            registry.get(&peer.device_id).map(|stored| &stored.status),
+            Some(&TrustedPeerStatus::Blocked)
+        );
+    }
+    #[test]
+    fn peer_can_be_provisioned_from_its_certificate() {
+        let identity = DeviceIdentity::generate();
+        let certificate = DeviceCertificate::generate(&identity)
+            .unwrap_or_else(|error| panic!("certificate generation failed: {error}"));
+        let peer = TrustedPeer::from_certificate(&certificate)
+            .unwrap_or_else(|error| panic!("certificate provisioning failed: {error}"));
+        assert_eq!(peer.public_key, identity.public_key_bytes());
+        assert_eq!(peer.device_id, identity.device_id());
     }
 }

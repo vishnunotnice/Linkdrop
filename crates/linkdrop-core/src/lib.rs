@@ -9,6 +9,9 @@ pub struct Device {
     pub operating_system: String,
     pub discovery_status: DiscoveryStatus,
     pub trust_status: TrustStatus,
+    pub transport_address: Option<String>,
+    pub transport_port: u16,
+    pub pairing_port: u16,
     pub last_seen: Option<DateTime<Utc>>,
 }
 

@@ -1992,6 +1992,8 @@ dependencies = [
  "linkdrop-core",
  "linkdrop-discovery",
  "linkdrop-identity",
+ "linkdrop-protocol",
+ "linkdrop-storage",
  "serde",
  "tauri",
  "tauri-build",
@@ -2042,13 +2044,16 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
 name = "linkdrop-storage"
 version = "0.1.0"
 dependencies = [
+ "linkdrop-identity",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -2057,7 +2062,13 @@ name = "linkdrop-transfer"
 version = "0.1.0"
 dependencies = [
  "linkdrop-core",
+ "linkdrop-identity",
+ "linkdrop-protocol",
+ "quinn",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

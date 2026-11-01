@@ -11,6 +11,8 @@ tauri-build = { version = "2", features = [] }
 linkdrop-core = { path = "../../../crates/linkdrop-core" }
 linkdrop-discovery = { path = "../../../crates/linkdrop-discovery" }
 linkdrop-identity = { path = "../../../crates/linkdrop-identity" }
+linkdrop-protocol = { path = "../../../crates/linkdrop-protocol" }
+linkdrop-storage = { path = "../../../crates/linkdrop-storage" }
 serde.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"

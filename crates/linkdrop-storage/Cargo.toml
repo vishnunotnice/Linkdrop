@@ -5,5 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+linkdrop-identity = { path = "../linkdrop-identity" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true

@@ -6,4 +6,12 @@ license.workspace = true
 
 [dependencies]
 linkdrop-core = { path = "../linkdrop-core" }
+quinn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+linkdrop-identity = { path = "../linkdrop-identity" }
+linkdrop-protocol = { path = "../linkdrop-protocol" }

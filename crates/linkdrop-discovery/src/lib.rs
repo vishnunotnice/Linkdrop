@@ -22,6 +22,9 @@ pub struct DiscoveryConfig {
     pub device_id: String,
     pub display_name: String,
     pub discoverable: bool,
+    /// UDP port of the local mutually-authenticated QUIC endpoint.
+    pub transport_port: u16,
+    pub pairing_port: u16,
 }
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,7 +78,11 @@ impl DiscoveryEngine {
             });
             return Ok(());
         }
-        if !valid_id(&config.device_id) || !valid_text(&config.display_name, 64) {
+        if !valid_id(&config.device_id)
+            || !valid_text(&config.display_name, 64)
+            || config.transport_port == 0
+            || config.pairing_port == 0
+        {
             return Err(DiscoveryError::InvalidConfiguration);
         }
         (self.sink)(DiscoveryEvent::Status {
@@ -83,19 +90,21 @@ impl DiscoveryEngine {
             message: None,
         });
         let daemon = ServiceDaemon::new().map_err(|e| DiscoveryError::Network(e.to_string()))?;
+        let pairing_port = config.pairing_port.to_string();
         let props = [
             ("id", config.device_id.as_str()),
             ("name", config.display_name.as_str()),
             ("os", std::env::consts::OS),
             ("version", VERSION),
             ("capabilities", "discovery"),
+            ("pairing_port", pairing_port.as_str()),
         ];
         let service = ServiceInfo::new(
             SERVICE_TYPE,
             &format!("Linkdrop-{}", config.device_id),
             &format!("linkdrop-{}.local.", config.device_id),
             "",
-            0,
+            config.transport_port,
             &props[..],
         )
         .map_err(|e| DiscoveryError::Network(e.to_string()))?
@@ -245,12 +254,23 @@ fn parse(service: &ServiceInfo, local: &str) -> Option<Device> {
     let id = service.get_property_val_str("id")?.to_owned();
     let name = service.get_property_val_str("name")?.to_owned();
     let os = service.get_property_val_str("os")?.to_owned();
+    let transport_address = service
+        .get_addresses()
+        .iter()
+        .map(ToString::to_string)
+        .min()?;
+    let pairing_port = service
+        .get_property_val_str("pairing_port")?
+        .parse::<u16>()
+        .ok()?;
     if id == local
         || !valid_id(&id)
         || !valid_text(&name, 64)
         || !valid_text(&os, 32)
         || service.get_property_val_str("version")? != VERSION
         || !valid_text(service.get_property_val_str("capabilities")?, 128)
+        || service.get_port() == 0
+        || pairing_port == 0
     {
         return None;
     }
@@ -260,6 +280,9 @@ fn parse(service: &ServiceInfo, local: &str) -> Option<Device> {
         operating_system: os,
         discovery_status: DiscoveryStatus::Found,
         trust_status: TrustStatus::Unknown,
+        transport_address: Some(transport_address),
+        transport_port: service.get_port(),
+        pairing_port,
         last_seen: Some(Utc::now()),
     })
 }
@@ -293,6 +316,8 @@ mod tests {
                 device_id: "aabbccddeeff001122334455".into(),
                 display_name: "test".into(),
                 discoverable: false,
+                transport_port: 1,
+                pairing_port: 2,
             })
             .unwrap_or(());
         assert!(engine.snapshot().is_empty());
