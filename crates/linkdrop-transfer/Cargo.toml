@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
 linkdrop-core = { path = "../linkdrop-core" }
 quinn.workspace = true
 serde.workspace = true

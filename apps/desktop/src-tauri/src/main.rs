@@ -12,8 +12,8 @@ use linkdrop_protocol::{
 };
 use linkdrop_storage::{JsonTrustedPeerStore, TrustedPeerStore};
 use linkdrop_transfer::{
-    receive_file, receive_transfer_offer, request_transfer, send_file, send_transfer_decision,
-    TransferOffer,
+    checksum_file, receive_file, receive_transfer_offer, request_transfer, send_file,
+    send_transfer_decision, TransferOffer,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -431,6 +431,9 @@ async fn send_transfer(
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "the selected file needs a valid Unicode filename".to_owned())?
         .to_owned();
+    let checksum = checksum_file(&source)
+        .await
+        .map_err(|error| format!("could not checksum selected file: {error}"))?;
     let recipient = state
         .discovery
         .snapshot()
@@ -486,6 +489,7 @@ async fn send_transfer(
                 transfer_id: id.clone(),
                 filename,
                 total_bytes: metadata.len(),
+                checksum,
             };
             update_transfer(&transfer_app, &id, |transfer| {
                 transfer.status = TransferStatus::AwaitingApproval

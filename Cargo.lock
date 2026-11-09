@@ -2064,6 +2064,7 @@ dependencies = [
 name = "linkdrop-transfer"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "linkdrop-core",
  "linkdrop-identity",
  "linkdrop-protocol",

@@ -13,6 +13,8 @@ pub struct TransferOffer {
     pub transfer_id: String,
     pub filename: String,
     pub total_bytes: u64,
+    /// Lowercase BLAKE3 digest of the source file, computed before the receiver approves.
+    pub checksum: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +44,28 @@ pub enum TransferProtocolError {
     File(String),
     #[error("received file size does not match the approved offer")]
     SizeMismatch,
+    #[error("received file checksum does not match the approved offer")]
+    ChecksumMismatch,
+}
+
+/// Computes the BLAKE3 digest of a regular source file without loading it into memory.
+pub async fn checksum_file(source: &Path) -> Result<String, TransferProtocolError> {
+    let mut source = tokio::fs::File::open(source)
+        .await
+        .map_err(|error| TransferProtocolError::File(error.to_string()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; FILE_CHUNK_BYTES];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .await
+            .map_err(|error| TransferProtocolError::File(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Sends an authenticated transfer offer and waits for the peer's decision.
@@ -143,6 +167,7 @@ pub async fn send_file(
         .await
         .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
     let mut transferred_bytes = 0_u64;
+    let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; FILE_CHUNK_BYTES];
     loop {
         let read = source
@@ -156,6 +181,7 @@ pub async fn send_file(
             .write_all(&buffer[..read])
             .await
             .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+        hasher.update(&buffer[..read]);
         transferred_bytes += read as u64;
         report_progress(TransferProgress {
             transfer_id: offer.transfer_id.clone(),
@@ -165,6 +191,9 @@ pub async fn send_file(
     }
     if transferred_bytes != offer.total_bytes {
         return Err(TransferProtocolError::SizeMismatch);
+    }
+    if hasher.finalize().to_hex().as_str() != offer.checksum {
+        return Err(TransferProtocolError::ChecksumMismatch);
     }
     stream
         .finish()
@@ -185,50 +214,92 @@ pub async fn receive_file(
     tokio::fs::create_dir_all(directory)
         .await
         .map_err(|error| TransferProtocolError::File(error.to_string()))?;
-    let destination = directory.join(&offer.filename);
-    let mut destination_file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&destination)
-        .await
-        .map_err(|error| TransferProtocolError::File(error.to_string()))?;
-    let mut stream = connection
-        .accept_uni()
-        .await
-        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
-    let mut transferred_bytes = 0_u64;
-    loop {
-        let Some(chunk) = stream
-            .read_chunk(FILE_CHUNK_BYTES, true)
+    let (destination, mut destination_file) =
+        create_destination_file(directory, &offer.filename).await?;
+    let result = async {
+        let mut stream = connection
+            .accept_uni()
             .await
-            .map_err(|error| TransferProtocolError::Message(error.to_string()))?
-        else {
-            break;
-        };
-        if transferred_bytes + chunk.bytes.len() as u64 > offer.total_bytes {
-            let _ = tokio::fs::remove_file(&destination).await;
-            return Err(TransferProtocolError::SizeMismatch);
+            .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+        let mut transferred_bytes = 0_u64;
+        let mut hasher = blake3::Hasher::new();
+        loop {
+            let Some(chunk) = stream
+                .read_chunk(FILE_CHUNK_BYTES, true)
+                .await
+                .map_err(|error| TransferProtocolError::Message(error.to_string()))?
+            else {
+                break;
+            };
+            if transferred_bytes + chunk.bytes.len() as u64 > offer.total_bytes {
+                return Err(TransferProtocolError::SizeMismatch);
+            }
+            destination_file
+                .write_all(&chunk.bytes)
+                .await
+                .map_err(|error| TransferProtocolError::File(error.to_string()))?;
+            hasher.update(&chunk.bytes);
+            transferred_bytes += chunk.bytes.len() as u64;
+            report_progress(TransferProgress {
+                transfer_id: offer.transfer_id.clone(),
+                transferred_bytes,
+                total_bytes: offer.total_bytes,
+            });
         }
         destination_file
-            .write_all(&chunk.bytes)
+            .flush()
             .await
             .map_err(|error| TransferProtocolError::File(error.to_string()))?;
-        transferred_bytes += chunk.bytes.len() as u64;
-        report_progress(TransferProgress {
-            transfer_id: offer.transfer_id.clone(),
-            transferred_bytes,
-            total_bytes: offer.total_bytes,
-        });
+        if transferred_bytes != offer.total_bytes {
+            return Err(TransferProtocolError::SizeMismatch);
+        }
+        if hasher.finalize().to_hex().as_str() != offer.checksum {
+            return Err(TransferProtocolError::ChecksumMismatch);
+        }
+        Ok(())
     }
-    destination_file
-        .flush()
-        .await
-        .map_err(|error| TransferProtocolError::File(error.to_string()))?;
-    if transferred_bytes != offer.total_bytes {
+    .await;
+    drop(destination_file);
+    if let Err(error) = result {
         let _ = tokio::fs::remove_file(&destination).await;
-        return Err(TransferProtocolError::SizeMismatch);
+        return Err(error);
     }
     Ok(destination)
+}
+
+async fn create_destination_file(
+    directory: &Path,
+    filename: &str,
+) -> Result<(PathBuf, tokio::fs::File), TransferProtocolError> {
+    let source = Path::new(filename);
+    let stem = source
+        .file_stem()
+        .and_then(|part| part.to_str())
+        .unwrap_or(filename);
+    let extension = source.extension().and_then(|part| part.to_str());
+    for index in 0..10_000_u32 {
+        let candidate_name = if index == 0 {
+            filename.to_owned()
+        } else if let Some(extension) = extension {
+            format!("{stem} ({index}).{extension}")
+        } else {
+            format!("{stem} ({index})")
+        };
+        let candidate = directory.join(candidate_name);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(TransferProtocolError::File(error.to_string())),
+        }
+    }
+    Err(TransferProtocolError::File(
+        "could not allocate a safe unique destination filename".to_owned(),
+    ))
 }
 
 async fn write_message<T: Serialize>(
@@ -263,6 +334,8 @@ fn validate_offer(offer: &TransferOffer) -> Result<(), TransferProtocolError> {
         || offer.filename.is_empty()
         || offer.filename.len() > 255
         || offer.filename.contains(['/', '\\', '\0'])
+        || offer.checksum.len() != 64
+        || !offer.checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(TransferProtocolError::InvalidOffer);
     }
@@ -307,9 +380,43 @@ mod tests {
                 transfer_id: "transfer-1".into(),
                 filename: "../../unsafe".into(),
                 total_bytes: 1,
+                checksum: "0".repeat(64),
             }),
             Err(TransferProtocolError::InvalidOffer)
         ));
+    }
+
+    #[tokio::test]
+    async fn allocates_a_non_overwriting_destination_for_duplicate_filenames() {
+        let root = std::env::temp_dir().join(format!(
+            "linkdrop-transfer-destination-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_else(|_| std::time::Duration::ZERO)
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&root)
+            .await
+            .unwrap_or_else(|error| panic!("temporary directory failed: {error}"));
+        let original = root.join("photo.jpg");
+        tokio::fs::write(&original, b"existing")
+            .await
+            .unwrap_or_else(|error| panic!("temporary file write failed: {error}"));
+        let (duplicate, file) = create_destination_file(&root, "photo.jpg")
+            .await
+            .unwrap_or_else(|error| panic!("destination allocation failed: {error}"));
+        drop(file);
+        assert_eq!(
+            duplicate.file_name().and_then(|name| name.to_str()),
+            Some("photo (1).jpg")
+        );
+        assert_eq!(
+            tokio::fs::read(&original)
+                .await
+                .unwrap_or_else(|error| panic!("existing file read failed: {error}")),
+            b"existing"
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[tokio::test]
@@ -356,6 +463,7 @@ mod tests {
             transfer_id: "transfer-1".into(),
             filename: "photo.jpg".into(),
             total_bytes: 42,
+            checksum: "0".repeat(64),
         };
 
         let (decision, received) = tokio::join!(
@@ -437,6 +545,7 @@ mod tests {
             transfer_id: "transfer-file-1".into(),
             filename: "received.bin".into(),
             total_bytes: payload.len() as u64,
+            checksum: blake3::hash(&payload).to_hex().to_string(),
         };
         let (decision, _) = tokio::join!(
             request_transfer(&client_connection, offer.clone()),
