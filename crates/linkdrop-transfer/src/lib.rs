@@ -71,6 +71,29 @@ pub struct TransferProgress {
     pub total_bytes: u64,
 }
 
+/// A receiver-approved manifest for a related group of files.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchOffer {
+    pub batch_id: String,
+    pub files: Vec<TransferOffer>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchDecision {
+    pub batch_id: String,
+    pub accepted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchProgress {
+    pub batch_id: String,
+    pub transfer_id: String,
+    pub transferred_bytes: u64,
+    pub total_bytes: u64,
+    pub aggregate_transferred_bytes: u64,
+    pub aggregate_total_bytes: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransferProtocolError {
     #[error("transfer offer is invalid")]
@@ -142,6 +165,30 @@ pub async fn request_transfer(
     Ok(decision)
 }
 
+/// Sends one bounded batch manifest and waits for one explicit receiver decision.
+pub async fn request_batch(
+    connection: &quinn::Connection,
+    batch: BatchOffer,
+) -> Result<BatchDecision, TransferProtocolError> {
+    validate_batch(&batch)?;
+    let (mut send, mut receive) =
+        tokio::time::timeout(TRANSFER_INACTIVITY_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| TransferProtocolError::Timeout)?
+            .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    write_message(&mut send, &batch).await?;
+    send.finish()
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    let decision: BatchDecision =
+        tokio::time::timeout(TRANSFER_INACTIVITY_TIMEOUT, read_message(&mut receive))
+            .await
+            .map_err(|_| TransferProtocolError::Timeout)??;
+    if decision.batch_id != batch.batch_id {
+        return Err(TransferProtocolError::MismatchedResponse);
+    }
+    Ok(decision)
+}
+
 /// Receives one transfer offer and sends the caller's approval decision.
 pub async fn respond_to_transfer(
     connection: &quinn::Connection,
@@ -183,6 +230,23 @@ pub async fn receive_transfer_offer(
     Ok((offer, send))
 }
 
+/// Reads one batch manifest and leaves its decision stream open for explicit UI approval.
+pub async fn receive_batch_offer(
+    connection: &quinn::Connection,
+) -> Result<(BatchOffer, quinn::SendStream), TransferProtocolError> {
+    let (send, mut receive) =
+        tokio::time::timeout(TRANSFER_INACTIVITY_TIMEOUT, connection.accept_bi())
+            .await
+            .map_err(|_| TransferProtocolError::Timeout)?
+            .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    let batch: BatchOffer =
+        tokio::time::timeout(TRANSFER_INACTIVITY_TIMEOUT, read_message(&mut receive))
+            .await
+            .map_err(|_| TransferProtocolError::Timeout)??;
+    validate_batch(&batch)?;
+    Ok((batch, send))
+}
+
 /// Sends the explicit user decision for an offer returned by [`receive_transfer_offer`].
 pub async fn send_transfer_decision(
     send: &mut quinn::SendStream,
@@ -194,6 +258,23 @@ pub async fn send_transfer_decision(
         accepted,
     };
     write_message(send, &decision).await?;
+    send.finish()
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))
+}
+
+pub async fn send_batch_decision(
+    send: &mut quinn::SendStream,
+    batch: &BatchOffer,
+    accepted: bool,
+) -> Result<(), TransferProtocolError> {
+    write_message(
+        send,
+        &BatchDecision {
+            batch_id: batch.batch_id.clone(),
+            accepted,
+        },
+    )
+    .await?;
     send.finish()
         .map_err(|error| TransferProtocolError::Message(error.to_string()))
 }
@@ -356,6 +437,71 @@ pub async fn receive_file_controlled(
     Ok(destination)
 }
 
+/// Streams every file in an approved manifest over the same authenticated connection.
+pub async fn send_batch_files(
+    connection: &quinn::Connection,
+    sources: &[PathBuf],
+    batch: &BatchOffer,
+    control: Option<&TransferControl>,
+    mut report_progress: impl FnMut(BatchProgress),
+) -> Result<(), TransferProtocolError> {
+    validate_batch(batch)?;
+    if sources.len() != batch.files.len() {
+        return Err(TransferProtocolError::InvalidOffer);
+    }
+    let aggregate_total_bytes = batch_total_bytes(batch)?;
+    let mut completed_bytes = 0_u64;
+    for (source, offer) in sources.iter().zip(&batch.files) {
+        let batch_id = batch.batch_id.clone();
+        send_file_controlled(connection, source, offer, control, |progress| {
+            report_progress(BatchProgress {
+                batch_id: batch_id.clone(),
+                transfer_id: progress.transfer_id,
+                transferred_bytes: progress.transferred_bytes,
+                total_bytes: progress.total_bytes,
+                aggregate_transferred_bytes: completed_bytes + progress.transferred_bytes,
+                aggregate_total_bytes,
+            });
+        })
+        .await?;
+        completed_bytes = completed_bytes.saturating_add(offer.total_bytes);
+    }
+    Ok(())
+}
+
+/// Receives every file in an approved manifest. Verified files completed before a later failure
+/// remain available; the failing file's partial output is removed by `receive_file_controlled`.
+pub async fn receive_batch_files(
+    connection: &quinn::Connection,
+    directory: &Path,
+    batch: &BatchOffer,
+    control: Option<&TransferControl>,
+    mut report_progress: impl FnMut(BatchProgress),
+) -> Result<Vec<PathBuf>, TransferProtocolError> {
+    validate_batch(batch)?;
+    let aggregate_total_bytes = batch_total_bytes(batch)?;
+    let mut completed_bytes = 0_u64;
+    let mut destinations = Vec::with_capacity(batch.files.len());
+    for offer in &batch.files {
+        let batch_id = batch.batch_id.clone();
+        let destination =
+            receive_file_controlled(connection, directory, offer, control, |progress| {
+                report_progress(BatchProgress {
+                    batch_id: batch_id.clone(),
+                    transfer_id: progress.transfer_id,
+                    transferred_bytes: progress.transferred_bytes,
+                    total_bytes: progress.total_bytes,
+                    aggregate_transferred_bytes: completed_bytes + progress.transferred_bytes,
+                    aggregate_total_bytes,
+                });
+            })
+            .await?;
+        completed_bytes = completed_bytes.saturating_add(offer.total_bytes);
+        destinations.push(destination);
+    }
+    Ok(destinations)
+}
+
 async fn create_destination_file(
     directory: &Path,
     filename: &str,
@@ -433,6 +579,34 @@ fn validate_offer(offer: &TransferOffer) -> Result<(), TransferProtocolError> {
     }
     Ok(())
 }
+
+fn validate_batch(batch: &BatchOffer) -> Result<(), TransferProtocolError> {
+    if batch.batch_id.is_empty()
+        || batch.batch_id.len() > 128
+        || batch.files.is_empty()
+        || batch.files.len() > 128
+    {
+        return Err(TransferProtocolError::InvalidOffer);
+    }
+    let mut identifiers = std::collections::HashSet::with_capacity(batch.files.len());
+    for offer in &batch.files {
+        validate_offer(offer)?;
+        if !identifiers.insert(&offer.transfer_id) {
+            return Err(TransferProtocolError::InvalidOffer);
+        }
+    }
+    let _ = batch_total_bytes(batch)?;
+    Ok(())
+}
+
+fn batch_total_bytes(batch: &BatchOffer) -> Result<u64, TransferProtocolError> {
+    batch
+        .files
+        .iter()
+        .try_fold(0_u64, |total, offer| total.checked_add(offer.total_bytes))
+        .filter(|total| *total <= MAX_TRANSFER_BYTES)
+        .ok_or(TransferProtocolError::SizeLimitExceeded)
+}
 #[derive(Debug, thiserror::Error)]
 pub enum TransitionError {
     #[error("invalid transfer transition from {from:?} to {to:?}")]
@@ -498,6 +672,29 @@ mod tests {
                 checksum: "0".repeat(64),
             }),
             Err(TransferProtocolError::SizeLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn validates_bounded_unique_batch_manifests() {
+        let file = |id: &str, name: &str| TransferOffer {
+            transfer_id: id.to_owned(),
+            filename: name.to_owned(),
+            total_bytes: 1,
+            checksum: "0".repeat(64),
+        };
+        let batch = BatchOffer {
+            batch_id: "batch-1".to_owned(),
+            files: vec![file("file-1", "first.txt"), file("file-2", "second.txt")],
+        };
+        assert!(validate_batch(&batch).is_ok());
+        let duplicate = BatchOffer {
+            batch_id: "batch-2".to_owned(),
+            files: vec![file("same", "first.txt"), file("same", "second.txt")],
+        };
+        assert!(matches!(
+            validate_batch(&duplicate),
+            Err(TransferProtocolError::InvalidOffer)
         ));
     }
 
