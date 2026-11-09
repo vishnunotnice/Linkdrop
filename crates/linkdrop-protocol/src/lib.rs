@@ -4,6 +4,10 @@ pub mod transport;
 use linkdrop_identity::{verify, DeviceCertificate, DeviceIdentity, TrustedPeer};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+/// Bounds the explicit pairing exchange so stalled peers cannot leave an unbounded task behind.
+pub const PAIRING_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PairingHello {
@@ -163,14 +167,18 @@ pub async fn initiate_pairing_exchange(
     connection: &quinn::Connection,
     local: &PairingEnvelope,
 ) -> Result<PairingEnvelope, PairingError> {
-    let (mut send, mut receive) = connection
-        .open_bi()
-        .await
-        .map_err(|error| PairingError::Transport(error.to_string()))?;
-    write_pairing_envelope(&mut send, local).await?;
-    send.finish()
-        .map_err(|error| PairingError::Transport(error.to_string()))?;
-    read_pairing_envelope(&mut receive).await
+    tokio::time::timeout(PAIRING_EXCHANGE_TIMEOUT, async {
+        let (mut send, mut receive) = connection
+            .open_bi()
+            .await
+            .map_err(|error| PairingError::Transport(error.to_string()))?;
+        write_pairing_envelope(&mut send, local).await?;
+        send.finish()
+            .map_err(|error| PairingError::Transport(error.to_string()))?;
+        read_pairing_envelope(&mut receive).await
+    })
+    .await
+    .map_err(|_| PairingError::Timeout)?
 }
 
 /// Receives a pairing envelope and returns the remote envelope after replying with `local`.
@@ -178,15 +186,19 @@ pub async fn respond_to_pairing_exchange(
     connection: &quinn::Connection,
     local: &PairingEnvelope,
 ) -> Result<PairingEnvelope, PairingError> {
-    let (mut send, mut receive) = connection
-        .accept_bi()
-        .await
-        .map_err(|error| PairingError::Transport(error.to_string()))?;
-    let remote = read_pairing_envelope(&mut receive).await?;
-    write_pairing_envelope(&mut send, local).await?;
-    send.finish()
-        .map_err(|error| PairingError::Transport(error.to_string()))?;
-    Ok(remote)
+    tokio::time::timeout(PAIRING_EXCHANGE_TIMEOUT, async {
+        let (mut send, mut receive) = connection
+            .accept_bi()
+            .await
+            .map_err(|error| PairingError::Transport(error.to_string()))?;
+        let remote = read_pairing_envelope(&mut receive).await?;
+        write_pairing_envelope(&mut send, local).await?;
+        send.finish()
+            .map_err(|error| PairingError::Transport(error.to_string()))?;
+        Ok(remote)
+    })
+    .await
+    .map_err(|_| PairingError::Timeout)?
 }
 
 async fn write_pairing_envelope(
@@ -224,6 +236,8 @@ pub enum PairingError {
     InvalidCertificate,
     #[error("pairing certificate does not match the remote identity")]
     IdentityMismatch,
+    #[error("pairing timed out; make sure both devices are open and on the same local network")]
+    Timeout,
     #[error("pairing transport failed: {0}")]
     Transport(String),
 }

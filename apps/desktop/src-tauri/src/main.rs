@@ -8,7 +8,7 @@ use linkdrop_identity::{
 use linkdrop_protocol::{
     initiate_pairing_exchange, respond_to_pairing_exchange,
     transport::{PairingEndpoint, SecureEndpoint},
-    verify_pairing_envelope, PairingEnvelope,
+    verify_pairing_envelope, PairingEnvelope, PAIRING_EXCHANGE_TIMEOUT,
 };
 use linkdrop_storage::{JsonTrustedPeerStore, TrustedPeerStore};
 use linkdrop_transfer::{
@@ -720,6 +720,9 @@ fn main() {
                             tracing::warn!(%error, "pairing exchange failed");
                         }
                     }
+                    // The initiator closes after it has read the envelope. Closing here first
+                    // races delivery of the response and leaves both UIs without a code.
+                    let _ = tokio::time::timeout(PAIRING_EXCHANGE_TIMEOUT, connection.closed()).await;
                     connection.close(0u32.into(), b"pairing exchange complete");
                 }
             });

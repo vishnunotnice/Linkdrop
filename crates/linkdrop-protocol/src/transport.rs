@@ -160,6 +160,10 @@ fn bind_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        initiate_pairing_exchange, respond_to_pairing_exchange, verify_pairing_envelope,
+        PairingEnvelope,
+    };
 
     fn identity_and_certificate() -> (DeviceIdentity, DeviceCertificate) {
         let identity = DeviceIdentity::generate();
@@ -203,6 +207,64 @@ mod tests {
         assert!(client_result.is_ok());
         assert!(matches!(server_result, Ok(Some(_))));
 
+        client.close();
+        server.close();
+    }
+
+    #[tokio::test]
+    async fn unpaired_devices_exchange_matching_pairing_codes() {
+        let (server_identity, server_certificate) = identity_and_certificate();
+        let (client_identity, client_certificate) = identity_and_certificate();
+        let localhost = "127.0.0.1:0".parse().unwrap_or_else(|_| unreachable!());
+        let server = PairingEndpoint::bind(localhost, &server_identity, &server_certificate)
+            .unwrap_or_else(|error| panic!("server bind failed: {error}"));
+        let client = PairingEndpoint::bind(localhost, &client_identity, &client_certificate)
+            .unwrap_or_else(|error| panic!("client bind failed: {error}"));
+        let server_address = server
+            .local_addr()
+            .unwrap_or_else(|error| panic!("server address unavailable: {error}"));
+        let now = 1_000;
+        let client_envelope = PairingEnvelope::create(&client_identity, &client_certificate, now);
+        let server_envelope = PairingEnvelope::create(&server_identity, &server_certificate, now);
+
+        let client_exchange = async {
+            let connection = client
+                .connect(
+                    server_address,
+                    "linkdrop",
+                    &client_identity,
+                    &client_certificate,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("client connect failed: {error}"));
+            let remote = initiate_pairing_exchange(&connection, &client_envelope)
+                .await
+                .unwrap_or_else(|error| panic!("client exchange failed: {error}"));
+            let code = verify_pairing_envelope(&client_envelope, &remote, b"linkdrop-pair/1", now)
+                .unwrap_or_else(|error| panic!("client verification failed: {error}"))
+                .1;
+            connection.close(0u32.into(), b"test complete");
+            code
+        };
+        let server_exchange = async {
+            let connection = server
+                .accept()
+                .await
+                .unwrap_or_else(|error| panic!("server accept failed: {error}"))
+                .expect("missing server connection");
+            let remote = respond_to_pairing_exchange(&connection, &server_envelope)
+                .await
+                .unwrap_or_else(|error| panic!("server exchange failed: {error}"));
+            let code = verify_pairing_envelope(&server_envelope, &remote, b"linkdrop-pair/1", now)
+                .unwrap_or_else(|error| panic!("server verification failed: {error}"))
+                .1;
+            let _ =
+                tokio::time::timeout(crate::PAIRING_EXCHANGE_TIMEOUT, connection.closed()).await;
+            code
+        };
+
+        let (client_code, server_code) = tokio::join!(client_exchange, server_exchange);
+        assert_eq!(client_code, server_code);
         client.close();
         server.close();
     }
