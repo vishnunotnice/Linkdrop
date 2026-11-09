@@ -14,6 +14,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_CONTROL_MESSAGE_BYTES: usize = 16 * 1024;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
+pub const MAX_TRANSFER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const TRANSFER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// In-memory control for one active transfer. It intentionally does not survive restarts.
 #[derive(Clone, Default)]
@@ -73,6 +75,10 @@ pub struct TransferProgress {
 pub enum TransferProtocolError {
     #[error("transfer offer is invalid")]
     InvalidOffer,
+    #[error("transfer offer exceeds the configured size limit")]
+    SizeLimitExceeded,
+    #[error("transfer timed out waiting for peer activity")]
+    Timeout,
     #[error("transfer response does not match the offer")]
     MismatchedResponse,
     #[error("transfer control stream failed: {0}")]
@@ -118,14 +124,18 @@ pub async fn request_transfer(
     offer: TransferOffer,
 ) -> Result<TransferDecision, TransferProtocolError> {
     validate_offer(&offer)?;
-    let (mut send, mut receive) = connection
-        .open_bi()
-        .await
-        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    let (mut send, mut receive) =
+        tokio::time::timeout(TRANSFER_INACTIVITY_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| TransferProtocolError::Timeout)?
+            .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
     write_message(&mut send, &offer).await?;
     send.finish()
         .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
-    let decision: TransferDecision = read_message(&mut receive).await?;
+    let decision: TransferDecision =
+        tokio::time::timeout(TRANSFER_INACTIVITY_TIMEOUT, read_message(&mut receive))
+            .await
+            .map_err(|_| TransferProtocolError::Timeout)??;
     if decision.transfer_id != offer.transfer_id {
         return Err(TransferProtocolError::MismatchedResponse);
     }
@@ -160,11 +170,15 @@ pub async fn respond_to_transfer(
 pub async fn receive_transfer_offer(
     connection: &quinn::Connection,
 ) -> Result<(TransferOffer, quinn::SendStream), TransferProtocolError> {
-    let (send, mut receive) = connection
-        .accept_bi()
-        .await
-        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
-    let offer: TransferOffer = read_message(&mut receive).await?;
+    let (send, mut receive) =
+        tokio::time::timeout(TRANSFER_INACTIVITY_TIMEOUT, connection.accept_bi())
+            .await
+            .map_err(|_| TransferProtocolError::Timeout)?
+            .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+    let offer: TransferOffer =
+        tokio::time::timeout(TRANSFER_INACTIVITY_TIMEOUT, read_message(&mut receive))
+            .await
+            .map_err(|_| TransferProtocolError::Timeout)??;
     validate_offer(&offer)?;
     Ok((offer, send))
 }
@@ -225,17 +239,20 @@ pub async fn send_file_controlled(
         if let Some(control) = control {
             control.wait_until_active().await?;
         }
-        let read = source
-            .read(&mut buffer)
+        let read = tokio::time::timeout(TRANSFER_INACTIVITY_TIMEOUT, source.read(&mut buffer))
             .await
+            .map_err(|_| TransferProtocolError::Timeout)?
             .map_err(|error| TransferProtocolError::File(error.to_string()))?;
         if read == 0 {
             break;
         }
-        stream
-            .write_all(&buffer[..read])
-            .await
-            .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
+        tokio::time::timeout(
+            TRANSFER_INACTIVITY_TIMEOUT,
+            stream.write_all(&buffer[..read]),
+        )
+        .await
+        .map_err(|_| TransferProtocolError::Timeout)?
+        .map_err(|error| TransferProtocolError::Message(error.to_string()))?;
         hasher.update(&buffer[..read]);
         transferred_bytes += read as u64;
         report_progress(TransferProgress {
@@ -293,10 +310,13 @@ pub async fn receive_file_controlled(
             if let Some(control) = control {
                 control.wait_until_active().await?;
             }
-            let Some(chunk) = stream
-                .read_chunk(FILE_CHUNK_BYTES, true)
-                .await
-                .map_err(|error| TransferProtocolError::Message(error.to_string()))?
+            let Some(chunk) = tokio::time::timeout(
+                TRANSFER_INACTIVITY_TIMEOUT,
+                stream.read_chunk(FILE_CHUNK_BYTES, true),
+            )
+            .await
+            .map_err(|_| TransferProtocolError::Timeout)?
+            .map_err(|error| TransferProtocolError::Message(error.to_string()))?
             else {
                 break;
             };
@@ -408,6 +428,9 @@ fn validate_offer(offer: &TransferOffer) -> Result<(), TransferProtocolError> {
     {
         return Err(TransferProtocolError::InvalidOffer);
     }
+    if offer.total_bytes > MAX_TRANSFER_BYTES {
+        return Err(TransferProtocolError::SizeLimitExceeded);
+    }
     Ok(())
 }
 #[derive(Debug, thiserror::Error)]
@@ -462,6 +485,19 @@ mod tests {
                 checksum: "0".repeat(64),
             }),
             Err(TransferProtocolError::InvalidOffer)
+        ));
+    }
+
+    #[test]
+    fn rejects_offers_over_the_transfer_size_limit() {
+        assert!(matches!(
+            validate_offer(&TransferOffer {
+                transfer_id: "transfer-1".into(),
+                filename: "large.bin".into(),
+                total_bytes: MAX_TRANSFER_BYTES + 1,
+                checksum: "0".repeat(64),
+            }),
+            Err(TransferProtocolError::SizeLimitExceeded)
         ));
     }
 

@@ -28,6 +28,8 @@ use std::{
 };
 use tauri::{Emitter, Manager, State};
 
+const MAX_ACTIVE_TRANSFERS: usize = 4;
+
 struct AppState {
     settings: Mutex<Settings>,
     device_id: String,
@@ -587,6 +589,16 @@ async fn send_transfer(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TransferInfo, String> {
+    let active_transfers = state
+        .transfer_controls
+        .lock()
+        .map_err(|_| "transfer controls are temporarily unavailable".to_owned())?
+        .len();
+    if active_transfers >= MAX_ACTIVE_TRANSFERS {
+        return Err(format!(
+            "at most {MAX_ACTIVE_TRANSFERS} transfers may run at once"
+        ));
+    }
     let source = PathBuf::from(file_path);
     let metadata = tokio::fs::metadata(&source)
         .await
@@ -1032,6 +1044,10 @@ fn main() {
                                     connection.close(0u32.into(), b"receiver unavailable");
                                     return;
                                 };
+                                if pending.len() >= MAX_ACTIVE_TRANSFERS {
+                                    connection.close(0u32.into(), b"receiver transfer limit reached");
+                                    return;
+                                }
                                 if pending.contains_key(&offer.transfer_id) {
                                     connection.close(0u32.into(), b"duplicate transfer id");
                                     return;
