@@ -2,23 +2,39 @@
 
 **Your files. Any device. No cloud.**
 
-Linkdrop is an open-source, local-first file sharing app. Phase 1 supplies a Tauri desktop shell, persistent preferences, a secure identity foundation, and deliberately non-functional discovery/transfer placeholders.
+Linkdrop is a local-first desktop file-sharing application for macOS and Windows. It discovers nearby devices on a LAN, pairs devices through an explicit verification-code ceremony, and transfers approved files over pinned mutual-TLS QUIC connections.
+
+## Current status
+
+The codebase includes discovery, pairing, trusted-device management, and streaming file transfer with receiver approval, progress, in-session pause/resume/cancel controls, safe duplicate filenames, and BLAKE3 integrity verification.
+
+Two-Mac end-to-end validation and Windows validation are still required before calling any build a production release. Linkdrop is not audited security software.
 
 ## Quick start
 
-Install Rust (stable), Node.js 20+, and pnpm. Then:
+Requirements: Rust stable, Node.js 20+, pnpm 9+, and platform build tools.
 
 ```sh
 pnpm install
-pnpm --dir apps/desktop tauri dev
+pnpm --filter @linkdrop/desktop tauri dev
 ```
 
-For checks, run `pnpm typecheck`, `pnpm lint`, `pnpm build`, `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo fmt --check`.
+Run the desktop app on two devices on the same LAN. Enable Discoverability on both, pair from Home, compare the six-digit code on both screens, and explicitly trust only if the codes match.
+
+## Checks
+
+```sh
+cargo fmt --all -- --check
+cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+pnpm --filter @linkdrop/desktop typecheck
+pnpm --filter @linkdrop/desktop lint
+pnpm --filter @linkdrop/desktop build
+```
+
+See [development](docs/development.md), [architecture](docs/architecture.md), [protocol](docs/protocol.md), [security model](docs/security.md), and the [release checklist](docs/release-checklist.md).
 
 ## License
 
-MIT. It is short, permissive, and suitable for broad open-source adoption. See [LICENSE](LICENSE).
-
-## Status
-
-Discovery and network transfer are **not implemented** in Phase 1. See `docs/` for the architecture, security assumptions, and roadmap.
+MIT. See [LICENSE](LICENSE).
