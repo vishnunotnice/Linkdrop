@@ -2,9 +2,9 @@
 
 ## Build and test
 
-- [ ] Rust format, check, strict Clippy, and workspace tests pass on the release commit.
-- [ ] Frontend type-check, lint, and production build pass.
-- [ ] Tauri production build succeeds on macOS and Windows.
+- [x] Rust format, check, strict Clippy, and workspace tests pass on the current local commit.
+- [x] Frontend type-check, lint, and production build pass.
+- [ ] Tauri production build succeeds on macOS and Windows. (macOS arm64 DMG built locally; Windows pending.)
 - [ ] Two-Mac pairing and bidirectional checksum validation pass.
 - [ ] macOS↔Windows and Windows↔Windows validation pass.
 
@@ -26,3 +26,4 @@
 - Windows build and runtime validation have not been recorded.
 - Code signing and Apple notarization credentials are not available in this repository.
 - In-session pause/resume is implemented; restart-resume checkpoints are not.
+- The local macOS package is ad-hoc signed only; it has not been installed or notarized.

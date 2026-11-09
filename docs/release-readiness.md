@@ -12,7 +12,14 @@
 
 ## Verified evidence
 
-At this repository revision, `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` pass. The workspace test count is 28. Frontend type-check, ESLint, and production build pass.
+At this repository revision, `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` pass. The workspace test count is 29. Frontend type-check, ESLint, and production build pass.
+
+An unsigned, ad-hoc-signed Apple Silicon development package was built locally from this checkout:
+
+- `target/release/bundle/macos/Linkdrop.app` (arm64)
+- `target/release/bundle/dmg/Linkdrop_0.1.0_aarch64.dmg` (UDZO, SHA-256 `7ff089f0370950ef33246c6a497d978cfa986e09a7b15854760712976c8fd272`)
+
+It has no Apple Team Identifier, notarization, or release signing and must not be distributed as a production package.
 
 ## Pending physical validation
 
@@ -30,5 +37,5 @@ No permissive TLS fallback was introduced. Pairing and normal transport use dist
 1. On both Macs, update to the same revision and run `pnpm --filter @linkdrop/desktop tauri dev`.
 2. Pair only once from one Mac, compare the code on both screens, and trust both sides.
 3. Send files in both directions, approve each offer, and compare `shasum -a 256` output.
-4. Build a macOS package with `pnpm --filter @linkdrop/desktop tauri build`.
+4. Build a macOS package with `pnpm --filter @linkdrop/desktop tauri build` and install-test it on a clean Mac.
 5. Run the same validation on Windows before publishing any release.
