@@ -12,21 +12,32 @@
 ```sh
 pnpm install
 pnpm dev                 # Vite web preview
-pnpm --dir apps/desktop tauri dev  # desktop application
+pnpm --filter @linkdrop/desktop tauri dev
 pnpm typecheck
 pnpm lint
 pnpm build
-cargo fmt --check
-cargo clippy --workspace -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The Tauri dialog plugin limits the frontend to user-mediated file or folder selection. It does not expose arbitrary filesystem reads. Settings are persisted in the app's local store. Desktop commands expose application information and settings only.
+The Tauri dialog plugin limits the frontend to user-mediated file selection. Settings, trusted peers, and transfer history are persisted locally. Private identity material stays in the platform credential store.
+
+## Two-Mac validation
+
+Run the same commit on both Macs. Enable Discoverability, wait for devices to appear, then click Pair only once. Both apps must display the same code before either user trusts the peer. Send in both directions, approve each transfer, and compare source/received checksums using `shasum -a 256`.
+
+## Windows packaging and firewall
+
+On Windows, install Rust stable, Node.js 20+, pnpm 9+, Microsoft C++ Build Tools, and WebView2. Build unsigned development installers from a Windows checkout:
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm --filter @linkdrop/desktop tauri build
+```
+
+Tauri emits MSI and/or NSIS artifacts under `target\release\bundle`. Allow Linkdrop through Windows Defender Firewall on **Private** networks only. Linkdrop needs local UDP for QUIC and mDNS; discovery will not work on client-isolated networks or where multicast DNS is blocked.
 
 ## Known limitations
 
-There is no mDNS discovery, peer pairing, QUIC, TLS session, transfer, history persistence, or SQLite database yet. The Transfers development preview uses a conspicuous demo label and is not live activity.
-
-## Phase 2 discovery
-
-Run Linkdrop on two macOS or Windows devices on the same LAN with `pnpm --dir apps/desktop tauri dev`. Enable Discoverability in Settings on both. Nearby devices should appear automatically through `_linkdrop._udp.local.`. If they do not, disable VPN/virtual adapters temporarily, check Wi-Fi client isolation, and allow multicast UDP/mDNS through macOS or Windows Defender Firewall. Discovery has no transfer listener and does not authenticate peers.
+Multi-file batch manifests and restart-resumable transfers are not yet implemented. In-session pause/resume/cancel, persistent history, safe retries, integrity checks, and strict trusted-peer transport are implemented.
