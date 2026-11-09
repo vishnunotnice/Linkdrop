@@ -149,6 +149,16 @@ impl TrustedPeerRegistry {
         peer.status = TrustedPeerStatus::Trusted;
         true
     }
+
+    pub fn remove(&mut self, device_id: &str) -> bool {
+        self.peers.remove(device_id).is_some()
+    }
+
+    pub fn is_blocked(&self, device_id: &str) -> bool {
+        self.peers
+            .get(device_id)
+            .is_some_and(|peer| peer.status == TrustedPeerStatus::Blocked)
+    }
 }
 
 impl TrustedPeer {
@@ -400,11 +410,14 @@ mod tests {
         registry.insert(peer.clone());
         assert_eq!(registry.trusted_peers().len(), 1);
         assert!(registry.block(&peer.device_id));
+        assert!(registry.is_blocked(&peer.device_id));
         assert!(registry.trusted_peers().is_empty());
         assert_eq!(
             registry.get(&peer.device_id).map(|stored| &stored.status),
             Some(&TrustedPeerStatus::Blocked)
         );
+        assert!(registry.remove(&peer.device_id));
+        assert!(registry.get(&peer.device_id).is_none());
     }
     #[test]
     fn peer_can_be_provisioned_from_its_certificate() {

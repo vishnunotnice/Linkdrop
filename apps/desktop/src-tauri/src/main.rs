@@ -239,6 +239,25 @@ fn set_peer_trust(
         .set_trusted_peers(&state.identity, &state.certificate, &peers.trusted_peers())
         .map_err(|error| error.to_string())
 }
+
+#[tauri::command]
+fn remove_peer(device_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut peers = state
+        .peers
+        .lock()
+        .map_err(|_| "trusted peers are temporarily unavailable".to_owned())?;
+    if !peers.remove(&device_id) {
+        return Err("device is not in the trusted-peer registry".to_owned());
+    }
+    state
+        .peer_store
+        .write_peers(&peers)
+        .map_err(|error| error.to_string())?;
+    state
+        .endpoint
+        .set_trusted_peers(&state.identity, &state.certificate, &peers.trusted_peers())
+        .map_err(|error| error.to_string())
+}
 #[tauri::command]
 fn approve_pairing(
     local: PairingEnvelope,
@@ -253,6 +272,14 @@ fn approve_pairing(
         .as_secs() as i64;
     let (peer, expected_code) = verify_pairing_envelope(&local, &remote, &transport_binding, now)
         .map_err(|error| error.to_string())?;
+    if state
+        .peers
+        .lock()
+        .map_err(|_| "trusted peers are temporarily unavailable".to_owned())?
+        .is_blocked(&peer.device_id)
+    {
+        return Err("this device is blocked; unblock it before pairing again".to_owned());
+    }
     if verification_code != expected_code {
         return Err("the pairing codes do not match".to_owned());
     }
@@ -300,8 +327,18 @@ async fn begin_pairing(
         .await
         .map_err(|error| error.to_string())?;
     tracing::info!(remote = %address, "received pairing envelope");
-    let (_, verification_code) = verify_pairing_envelope(&local, &remote, b"linkdrop-pair/1", now)
-        .map_err(|error| error.to_string())?;
+    let (peer, verification_code) =
+        verify_pairing_envelope(&local, &remote, b"linkdrop-pair/1", now)
+            .map_err(|error| error.to_string())?;
+    if state
+        .peers
+        .lock()
+        .map_err(|_| "trusted peers are temporarily unavailable".to_owned())?
+        .is_blocked(&peer.device_id)
+    {
+        connection.close(0u32.into(), b"blocked device");
+        return Err("this device is blocked; unblock it before pairing again".to_owned());
+    }
     connection.close(0u32.into(), b"pairing exchange complete");
     Ok(PairingRequest {
         local,
@@ -700,7 +737,21 @@ fn main() {
                             b"linkdrop-pair/1",
                             now,
                         ) {
-                            Ok((_, verification_code)) => {
+                            Ok((peer, verification_code)) => {
+                                let state = pairing_handle.state::<AppState>();
+                                let is_blocked = state
+                                    .peers
+                                    .lock()
+                                    .map(|peers| peers.is_blocked(&peer.device_id))
+                                    .unwrap_or(true);
+                                if is_blocked {
+                                    tracing::warn!(
+                                        remote = %connection.remote_address(),
+                                        "ignored pairing request from blocked device"
+                                    );
+                                    connection.close(0u32.into(), b"blocked device");
+                                    continue;
+                                }
                                 tracing::info!(
                                     remote = %connection.remote_address(),
                                     "pairing envelope verified; showing confirmation"
@@ -818,6 +869,7 @@ fn main() {
             get_transport_information,
             list_trusted_peers,
             set_peer_trust,
+            remove_peer,
             approve_pairing,
             begin_pairing,
             read_settings,
