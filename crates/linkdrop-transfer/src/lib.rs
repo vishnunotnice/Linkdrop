@@ -1,5 +1,12 @@
 //! Transfer state-machine boundary; no file I/O in Phase 1.
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use linkdrop_core::TransferStatus;
 use serde::{Deserialize, Serialize};
@@ -7,6 +14,38 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_CONTROL_MESSAGE_BYTES: usize = 16 * 1024;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// In-memory control for one active transfer. It intentionally does not survive restarts.
+#[derive(Clone, Default)]
+pub struct TransferControl {
+    paused: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl TransferControl {
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+    }
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    async fn wait_until_active(&self) -> Result<(), TransferProtocolError> {
+        while self.paused.load(Ordering::Acquire) {
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(TransferProtocolError::Cancelled);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(TransferProtocolError::Cancelled);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferOffer {
@@ -46,6 +85,8 @@ pub enum TransferProtocolError {
     SizeMismatch,
     #[error("received file checksum does not match the approved offer")]
     ChecksumMismatch,
+    #[error("transfer was cancelled")]
+    Cancelled,
 }
 
 /// Computes the BLAKE3 digest of a regular source file without loading it into memory.
@@ -150,6 +191,17 @@ pub async fn send_file(
     connection: &quinn::Connection,
     source: &Path,
     offer: &TransferOffer,
+    report_progress: impl FnMut(TransferProgress),
+) -> Result<(), TransferProtocolError> {
+    send_file_controlled(connection, source, offer, None, report_progress).await
+}
+
+/// Streams an approved source file, observing an optional in-session control handle.
+pub async fn send_file_controlled(
+    connection: &quinn::Connection,
+    source: &Path,
+    offer: &TransferOffer,
+    control: Option<&TransferControl>,
     mut report_progress: impl FnMut(TransferProgress),
 ) -> Result<(), TransferProtocolError> {
     validate_offer(offer)?;
@@ -170,6 +222,9 @@ pub async fn send_file(
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; FILE_CHUNK_BYTES];
     loop {
+        if let Some(control) = control {
+            control.wait_until_active().await?;
+        }
         let read = source
             .read(&mut buffer)
             .await
@@ -208,6 +263,17 @@ pub async fn receive_file(
     connection: &quinn::Connection,
     directory: &Path,
     offer: &TransferOffer,
+    report_progress: impl FnMut(TransferProgress),
+) -> Result<PathBuf, TransferProtocolError> {
+    receive_file_controlled(connection, directory, offer, None, report_progress).await
+}
+
+/// Receives an approved file while observing an optional in-session control handle.
+pub async fn receive_file_controlled(
+    connection: &quinn::Connection,
+    directory: &Path,
+    offer: &TransferOffer,
+    control: Option<&TransferControl>,
     mut report_progress: impl FnMut(TransferProgress),
 ) -> Result<PathBuf, TransferProtocolError> {
     validate_offer(offer)?;
@@ -224,6 +290,9 @@ pub async fn receive_file(
         let mut transferred_bytes = 0_u64;
         let mut hasher = blake3::Hasher::new();
         loop {
+            if let Some(control) = control {
+                control.wait_until_active().await?;
+            }
             let Some(chunk) = stream
                 .read_chunk(FILE_CHUNK_BYTES, true)
                 .await
@@ -373,6 +442,16 @@ mod tests {
             TransferStatus::Cancelled
         ));
     }
+
+    #[tokio::test]
+    async fn cancelled_control_stops_a_transfer_before_reading_more_bytes() {
+        let control = TransferControl::default();
+        control.cancel();
+        assert!(matches!(
+            control.wait_until_active().await,
+            Err(TransferProtocolError::Cancelled)
+        ));
+    }
     #[test]
     fn rejects_unsafe_filenames_before_opening_a_stream() {
         assert!(matches!(
@@ -392,7 +471,7 @@ mod tests {
             "linkdrop-transfer-destination-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_else(|_| std::time::Duration::ZERO)
+                .unwrap_or(std::time::Duration::ZERO)
                 .as_nanos()
         ));
         tokio::fs::create_dir_all(&root)
@@ -530,7 +609,7 @@ mod tests {
             "linkdrop-transfer-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_else(|_| std::time::Duration::ZERO)
+                .unwrap_or(std::time::Duration::ZERO)
                 .as_nanos()
         ));
         let source = root.join("source.bin");

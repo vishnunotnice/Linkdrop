@@ -12,8 +12,8 @@ use linkdrop_protocol::{
 };
 use linkdrop_storage::{JsonTrustedPeerStore, TrustedPeerStore};
 use linkdrop_transfer::{
-    checksum_file, receive_file, receive_transfer_offer, request_transfer, send_file,
-    send_transfer_decision, TransferOffer,
+    checksum_file, receive_file_controlled, receive_transfer_offer, request_transfer,
+    send_file_controlled, send_transfer_decision, TransferControl, TransferOffer,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -39,6 +39,7 @@ struct AppState {
     discovery: DiscoveryEngine,
     transfers: Mutex<HashMap<String, TransferInfo>>,
     pending_inbound: Mutex<HashMap<String, PendingInboundTransfer>>,
+    transfer_controls: Mutex<HashMap<String, TransferControl>>,
     next_transfer_id: AtomicU64,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -449,6 +450,44 @@ fn list_transfers(state: State<'_, AppState>) -> Result<Vec<TransferInfo>, Strin
 }
 
 #[tauri::command]
+fn control_transfer(
+    transfer_id: String,
+    action: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let control = state
+        .transfer_controls
+        .lock()
+        .map_err(|_| "transfer controls are temporarily unavailable".to_owned())?
+        .get(&transfer_id)
+        .cloned()
+        .ok_or_else(|| "this transfer is no longer active".to_owned())?;
+    match action.as_str() {
+        "pause" => {
+            control.pause();
+            update_transfer(&app, &transfer_id, |transfer| {
+                transfer.status = TransferStatus::Paused
+            });
+        }
+        "resume" => {
+            control.resume();
+            update_transfer(&app, &transfer_id, |transfer| {
+                transfer.status = TransferStatus::Transferring
+            });
+        }
+        "cancel" => {
+            control.cancel();
+            update_transfer(&app, &transfer_id, |transfer| {
+                transfer.status = TransferStatus::Cancelled
+            });
+        }
+        _ => return Err("unsupported transfer action".to_owned()),
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn send_transfer(
     file_path: String,
     recipient_id: String,
@@ -507,6 +546,12 @@ async fn send_transfer(
         error: None,
     };
     publish_transfer(&app, &state, transfer.clone());
+    let control = TransferControl::default();
+    state
+        .transfer_controls
+        .lock()
+        .map_err(|_| "transfer controls are temporarily unavailable".to_owned())?
+        .insert(id.clone(), control.clone());
 
     let endpoint = state.endpoint.clone();
     let identity = Arc::clone(&state.identity);
@@ -545,12 +590,18 @@ async fn send_transfer(
                 transfer.status = TransferStatus::Transferring
             });
             let progress_app = transfer_app.clone();
-            send_file(&connection, &source, &offer, move |progress| {
-                update_transfer(&progress_app, &progress.transfer_id, |transfer| {
-                    transfer.transferred_bytes = progress.transferred_bytes;
-                    transfer.total_bytes = progress.total_bytes;
-                });
-            })
+            send_file_controlled(
+                &connection,
+                &source,
+                &offer,
+                Some(&control),
+                move |progress| {
+                    update_transfer(&progress_app, &progress.transfer_id, |transfer| {
+                        transfer.transferred_bytes = progress.transferred_bytes;
+                        transfer.total_bytes = progress.total_bytes;
+                    });
+                },
+            )
             .await
             .map_err(|error| error.to_string())?;
             update_transfer(&transfer_app, &id, |transfer| {
@@ -564,9 +615,16 @@ async fn send_transfer(
         if let Err(error) = result {
             tracing::warn!(transfer_id = %id, %error, "outgoing transfer failed");
             update_transfer(&transfer_app, &id, |transfer| {
-                transfer.status = TransferStatus::Failed;
-                transfer.error = Some(error);
+                if error == "transfer was cancelled" {
+                    transfer.status = TransferStatus::Cancelled;
+                } else {
+                    transfer.status = TransferStatus::Failed;
+                    transfer.error = Some(error);
+                }
             });
+        }
+        if let Ok(mut controls) = transfer_app.state::<AppState>().transfer_controls.lock() {
+            controls.remove(&id);
         }
     });
     Ok(transfer)
@@ -626,15 +684,27 @@ async fn decide_incoming_transfer(
     update_transfer(&app, &transfer_id, |transfer| {
         transfer.status = TransferStatus::Transferring;
     });
+    let control = TransferControl::default();
+    state
+        .transfer_controls
+        .lock()
+        .map_err(|_| "transfer controls are temporarily unavailable".to_owned())?
+        .insert(transfer_id.clone(), control.clone());
     tauri::async_runtime::spawn(async move {
         let offer = pending.offer;
         let progress_app = app.clone();
-        let result = receive_file(&pending.connection, &downloads, &offer, move |progress| {
-            update_transfer(&progress_app, &progress.transfer_id, |transfer| {
-                transfer.transferred_bytes = progress.transferred_bytes;
-                transfer.total_bytes = progress.total_bytes;
-            });
-        })
+        let result = receive_file_controlled(
+            &pending.connection,
+            &downloads,
+            &offer,
+            Some(&control),
+            move |progress| {
+                update_transfer(&progress_app, &progress.transfer_id, |transfer| {
+                    transfer.transferred_bytes = progress.transferred_bytes;
+                    transfer.total_bytes = progress.total_bytes;
+                });
+            },
+        )
         .await;
         match result {
             Ok(path) => update_transfer(&app, &transfer_id, |transfer| {
@@ -646,12 +716,19 @@ async fn decide_incoming_transfer(
                 let error = error.to_string();
                 tracing::warn!(transfer_id = %transfer_id, %error, "incoming transfer failed");
                 update_transfer(&app, &transfer_id, |transfer| {
-                    transfer.status = TransferStatus::Failed;
-                    transfer.error = Some(error);
+                    if error == "transfer was cancelled" {
+                        transfer.status = TransferStatus::Cancelled;
+                    } else {
+                        transfer.status = TransferStatus::Failed;
+                        transfer.error = Some(error);
+                    }
                 });
             }
         }
         pending.connection.close(0u32.into(), b"transfer complete");
+        if let Ok(mut controls) = app.state::<AppState>().transfer_controls.lock() {
+            controls.remove(&transfer_id);
+        }
     });
     Ok(())
 }
@@ -800,6 +877,7 @@ fn main() {
                 discovery,
                 transfers: Mutex::new(HashMap::new()),
                 pending_inbound: Mutex::new(HashMap::new()),
+                transfer_controls: Mutex::new(HashMap::new()),
                 next_transfer_id: AtomicU64::new(1),
             });
             let transfer_listener = app.state::<AppState>().endpoint.clone();
@@ -878,6 +956,7 @@ fn main() {
             stop_discovery,
             nearby_devices,
             list_transfers,
+            control_transfer,
             send_transfer,
             decide_incoming_transfer
         ])
