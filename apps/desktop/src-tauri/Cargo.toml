@@ -15,6 +15,7 @@ linkdrop-protocol = { path = "../../../crates/linkdrop-protocol" }
 linkdrop-storage = { path = "../../../crates/linkdrop-storage" }
 linkdrop-transfer = { path = "../../../crates/linkdrop-transfer" }
 serde.workspace = true
+serde_json.workspace = true
 quinn.workspace = true
 tokio.workspace = true
 tauri = { version = "2", features = [] }

@@ -18,6 +18,7 @@ use linkdrop_transfer::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fs, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{
@@ -34,6 +35,7 @@ struct AppState {
     certificate: DeviceCertificate,
     peers: Mutex<TrustedPeerRegistry>,
     peer_store: JsonTrustedPeerStore,
+    transfer_store: JsonTransferStore,
     endpoint: SecureEndpoint,
     pairing_endpoint: PairingEndpoint,
     discovery: DiscoveryEngine,
@@ -89,7 +91,7 @@ struct PairingRequest {
     verification_code: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TransferInfo {
     id: String,
@@ -103,6 +105,50 @@ struct TransferInfo {
     direction: String,
     saved_path: Option<String>,
     error: Option<String>,
+    source_path: Option<String>,
+    recipient_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RetryTransfer {
+    file_path: String,
+    recipient_id: String,
+}
+
+struct JsonTransferStore {
+    path: PathBuf,
+}
+
+impl JsonTransferStore {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn read(&self) -> Result<HashMap<String, TransferInfo>, String> {
+        match fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| format!("transfer history is malformed: {error}")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(error) => Err(format!("could not read transfer history: {error}")),
+        }
+    }
+
+    fn write(&self, transfers: &HashMap<String, TransferInfo>) -> Result<(), String> {
+        let bytes = serde_json::to_vec(transfers)
+            .map_err(|error| format!("could not encode transfer history: {error}"))?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| "transfer history path has no parent".to_owned())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create transfer history directory: {error}"))?;
+        let temporary = self.path.with_extension("json.tmp");
+        fs::write(&temporary, bytes)
+            .map_err(|error| format!("could not write transfer history: {error}"))?;
+        fs::rename(&temporary, &self.path)
+            .map_err(|error| format!("could not save transfer history: {error}"))
+    }
 }
 
 struct PendingInboundTransfer {
@@ -114,6 +160,9 @@ struct PendingInboundTransfer {
 fn publish_transfer(app: &tauri::AppHandle, state: &AppState, transfer: TransferInfo) {
     if let Ok(mut transfers) = state.transfers.lock() {
         transfers.insert(transfer.id.clone(), transfer.clone());
+        if let Err(error) = state.transfer_store.write(&transfers) {
+            tracing::warn!(%error, "could not persist transfer history");
+        }
     } else {
         tracing::warn!(transfer_id = %transfer.id, "transfer state is temporarily unavailable");
     }
@@ -131,7 +180,11 @@ fn update_transfer(
     let transfer = state.transfers.lock().ok().and_then(|mut transfers| {
         let transfer = transfers.get_mut(transfer_id)?;
         update(transfer);
-        Some(transfer.clone())
+        let result = transfer.clone();
+        if let Err(error) = state.transfer_store.write(&transfers) {
+            tracing::warn!(%error, "could not persist transfer history");
+        }
+        Some(result)
     });
     if let Some(transfer) = transfer {
         if let Err(error) = app.emit("transfer-event", transfer) {
@@ -450,6 +503,46 @@ fn list_transfers(state: State<'_, AppState>) -> Result<Vec<TransferInfo>, Strin
 }
 
 #[tauri::command]
+fn retry_transfer(
+    transfer_id: String,
+    state: State<'_, AppState>,
+) -> Result<RetryTransfer, String> {
+    let transfer = state
+        .transfers
+        .lock()
+        .map_err(|_| "transfer state is temporarily unavailable".to_owned())?
+        .get(&transfer_id)
+        .cloned()
+        .ok_or_else(|| "transfer was not found".to_owned())?;
+    if transfer.status != TransferStatus::Failed || transfer.direction != "sending" {
+        return Err("only failed outgoing transfers can be retried".to_owned());
+    }
+    Ok(RetryTransfer {
+        file_path: transfer
+            .source_path
+            .ok_or_else(|| "the original source file is unavailable".to_owned())?,
+        recipient_id: transfer
+            .recipient_id
+            .ok_or_else(|| "the original recipient is unavailable".to_owned())?,
+    })
+}
+
+#[tauri::command]
+fn clear_finished_transfers(state: State<'_, AppState>) -> Result<(), String> {
+    let mut transfers = state
+        .transfers
+        .lock()
+        .map_err(|_| "transfer state is temporarily unavailable".to_owned())?;
+    transfers.retain(|_, transfer| {
+        !matches!(
+            transfer.status,
+            TransferStatus::Completed | TransferStatus::Failed | TransferStatus::Cancelled
+        )
+    });
+    state.transfer_store.write(&transfers)
+}
+
+#[tauri::command]
 fn control_transfer(
     transfer_id: String,
     action: String,
@@ -535,7 +628,7 @@ async fn send_transfer(
     let transfer = TransferInfo {
         id: id.clone(),
         sender_device_id: state.identity.device_id(),
-        receiver_device_id: recipient_id,
+        receiver_device_id: recipient_id.clone(),
         filename: filename.clone(),
         total_bytes: metadata.len(),
         transferred_bytes: 0,
@@ -544,6 +637,8 @@ async fn send_transfer(
         direction: "sending".to_owned(),
         saved_path: None,
         error: None,
+        source_path: Some(source.display().to_string()),
+        recipient_id: Some(recipient_id.clone()),
     };
     publish_transfer(&app, &state, transfer.clone());
     let control = TransferControl::default();
@@ -779,6 +874,26 @@ fn main() {
             )?;
             let peer_store = JsonTrustedPeerStore::new(app_config.join("trusted-peers.json"));
             let peers = peer_store.read_peers()?;
+            let transfer_store = JsonTransferStore::new(app_config.join("transfer-history.json"));
+            let mut transfers = transfer_store.read().map_err(io::Error::other)?;
+            let mut recovered = false;
+            for transfer in transfers.values_mut() {
+                if matches!(
+                    transfer.status,
+                    TransferStatus::Pending
+                        | TransferStatus::AwaitingApproval
+                        | TransferStatus::Connecting
+                        | TransferStatus::Transferring
+                        | TransferStatus::Paused
+                ) {
+                    transfer.status = TransferStatus::Failed;
+                    transfer.error = Some("interrupted because Linkdrop was restarted".to_owned());
+                    recovered = true;
+                }
+            }
+            if recovered {
+                transfer_store.write(&transfers).map_err(io::Error::other)?;
+            }
             let (endpoint, pairing_endpoint) = tauri::async_runtime::block_on(async {
                 let endpoint = SecureEndpoint::bind(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -872,10 +987,11 @@ fn main() {
                 certificate,
                 peers: Mutex::new(peers),
                 peer_store,
+                transfer_store,
                 endpoint,
                 pairing_endpoint,
                 discovery,
-                transfers: Mutex::new(HashMap::new()),
+                transfers: Mutex::new(transfers),
                 pending_inbound: Mutex::new(HashMap::new()),
                 transfer_controls: Mutex::new(HashMap::new()),
                 next_transfer_id: AtomicU64::new(1),
@@ -909,6 +1025,8 @@ fn main() {
                                     direction: "receiving".to_owned(),
                                     saved_path: None,
                                     error: None,
+                                    source_path: None,
+                                    recipient_id: None,
                                 };
                                 let Ok(mut pending) = state.pending_inbound.lock() else {
                                     connection.close(0u32.into(), b"receiver unavailable");
@@ -956,10 +1074,57 @@ fn main() {
             stop_discovery,
             nearby_devices,
             list_transfers,
+            retry_transfer,
+            clear_finished_transfers,
             control_transfer,
             send_transfer,
             decide_incoming_transfer
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| tracing::error!(%error, "failed to launch Linkdrop"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_history_round_trips_retry_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "linkdrop-transfer-history-{}.json",
+            std::process::id()
+        ));
+        let store = JsonTransferStore::new(path.clone());
+        let transfer = TransferInfo {
+            id: "transfer-1".to_owned(),
+            sender_device_id: "sender".to_owned(),
+            receiver_device_id: "receiver".to_owned(),
+            filename: "example.txt".to_owned(),
+            total_bytes: 4,
+            transferred_bytes: 4,
+            status: TransferStatus::Completed,
+            created_at: "1".to_owned(),
+            direction: "sending".to_owned(),
+            saved_path: None,
+            error: None,
+            source_path: Some("/tmp/example.txt".to_owned()),
+            recipient_id: Some("receiver".to_owned()),
+        };
+        let mut transfers = HashMap::new();
+        transfers.insert(transfer.id.clone(), transfer);
+        store
+            .write(&transfers)
+            .unwrap_or_else(|error| panic!("history write failed: {error}"));
+        let restored = store
+            .read()
+            .unwrap_or_else(|error| panic!("history read failed: {error}"));
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored
+                .get("transfer-1")
+                .and_then(|item| item.source_path.as_deref()),
+            Some("/tmp/example.txt")
+        );
+        let _ = fs::remove_file(path);
+    }
 }
